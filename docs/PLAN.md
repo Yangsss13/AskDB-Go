@@ -105,3 +105,27 @@
 **数据一致性**：Guard 不替代 askdb_reader 只读账号，两者共同作为纵深防御。不声称 Exactly Once。
 
 **不实现**：真实 LLM、Retry Queue、DLQ、Outbox、JWT、前端、复杂 SQL 自动修复、结果分页
+
+---
+
+### 阶段 6A：用户认证、JWT 与查询任务归属（当前）
+
+**目标**：引入用户系统，查询任务按用户隔离。注册/登录签发 JWT，受保护接口用 Bearer 中间件鉴权。
+
+- [x] `000003_create_users` migration：`users` 表（id / email 唯一 / password_hash / 时间戳）
+- [x] `000004_add_user_id_to_query_jobs` migration：`query_jobs.user_id` 可空（兼容历史行）+ 索引 + 外键 `ON DELETE RESTRICT`；down 按外键→索引→字段顺序删除
+- [x] `internal/user/`：User 模型、Repository（唯一约束 1062 → 409）、AuthService（注册/登录）、AuthHandler
+- [x] `internal/auth/`：JWTManager（HS256 签发与校验），API 专属，Worker 不导入
+- [x] bcrypt DefaultCost 哈希；密码按字节限制 8～72，不 trim；账号不存在执行 dummy bcrypt 防枚举
+- [x] JWT 身份存标准 `sub`，严格校验 `sub`/`iss`/`iat`/`exp`，仅接受 HS256
+- [x] `internal/middleware/`：Bearer 中间件，依赖验证接口，缺失/过期/算法/issuer 不符均 401
+- [x] `POST /api/v1/auth/register`（201/400/409）、`POST /api/v1/auth/login`（200/401）为公开接口
+- [x] 三个 `query-jobs` 接口受 Bearer 保护；创建写入 `user_id`
+- [x] Get/GetResult 先在 MySQL 校验归属，跨用户与历史 NULL 任务统一返回 404；GetResult 归属+状态+过期校验通过后才读 Redis
+- [x] JWT 配置（`JWT_SECRET`≥32 字节 / `JWT_ISSUER` / `JWT_ACCESS_TTL`）；`JWT_SECRET` 仅 API 必需，Worker 无此校验
+- [x] RabbitMQ 消息仍只含 job_id，Worker 行为不变
+- [x] 全部单元测试（注册/重复邮箱/密码边界/登录成败/JWT 算法·issuer·过期·缺 iat/Bearer 缺失/本人·跨用户 404/跨用户不读 Redis），`go test -race ./...` 通过
+
+**安全约束**：日志与响应不含密码、哈希、Token 或底层数据库错误；404 对不存在/他人/NULL 归属任务一致，避免 IDOR 探测。
+
+**不实现**：数据源管理、RBAC、刷新 Token、OAuth、Retry Queue、DLQ、Outbox、真实 LLM、前端

@@ -22,11 +22,13 @@ func TestLoad_AllPresent(t *testing.T) {
 	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/askdb_app?parseTime=true")
 	os.Setenv("MYSQL_READER_DSN", "reader:pass@tcp(localhost:3306)/askdb_demo?parseTime=true")
 	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("JWT_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") // 32 bytes
 	os.Setenv("API_PORT", "9090")
 	t.Cleanup(func() {
 		os.Unsetenv("MYSQL_DSN")
 		os.Unsetenv("MYSQL_READER_DSN")
 		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("JWT_SECRET")
 		os.Unsetenv("API_PORT")
 	})
 
@@ -58,11 +60,13 @@ func TestLoad_QueryResultTTL_Custom(t *testing.T) {
 	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
 	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
 	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("JWT_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	os.Setenv("QUERY_RESULT_TTL", "30m")
 	t.Cleanup(func() {
 		os.Unsetenv("MYSQL_DSN")
 		os.Unsetenv("MYSQL_READER_DSN")
 		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("JWT_SECRET")
 		os.Unsetenv("QUERY_RESULT_TTL")
 	})
 
@@ -79,11 +83,13 @@ func TestLoad_QueryResultTTL_InvalidValue_UsesDefault(t *testing.T) {
 	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
 	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
 	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("JWT_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	os.Setenv("QUERY_RESULT_TTL", "not-a-duration")
 	t.Cleanup(func() {
 		os.Unsetenv("MYSQL_DSN")
 		os.Unsetenv("MYSQL_READER_DSN")
 		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("JWT_SECRET")
 		os.Unsetenv("QUERY_RESULT_TTL")
 	})
 
@@ -165,11 +171,13 @@ func TestLoad_MaxQueryRows_Custom(t *testing.T) {
 	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
 	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
 	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("JWT_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	os.Setenv("MAX_QUERY_ROWS", "50")
 	t.Cleanup(func() {
 		os.Unsetenv("MYSQL_DSN")
 		os.Unsetenv("MYSQL_READER_DSN")
 		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("JWT_SECRET")
 		os.Unsetenv("MAX_QUERY_ROWS")
 	})
 	cfg, err := Load()
@@ -201,11 +209,13 @@ func TestLoad_MaxResultBytes_Custom(t *testing.T) {
 	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
 	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
 	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	os.Setenv("JWT_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	os.Setenv("MAX_RESULT_BYTES", "512000")
 	t.Cleanup(func() {
 		os.Unsetenv("MYSQL_DSN")
 		os.Unsetenv("MYSQL_READER_DSN")
 		os.Unsetenv("RABBITMQ_URL")
+		os.Unsetenv("JWT_SECRET")
 		os.Unsetenv("MAX_RESULT_BYTES")
 	})
 	cfg, err := Load()
@@ -248,5 +258,74 @@ func TestGetIntEnv(t *testing.T) {
 	os.Unsetenv("TEST_INT_XYZ")
 	if got := getIntEnv("TEST_INT_XYZ", 7); got != 7 {
 		t.Errorf("expected fallback when unset, got %d", got)
+	}
+}
+
+// setBaseEnv sets the minimal valid non-JWT variables Load requires, and
+// registers their cleanup. Individual tests then provoke exactly one error.
+func setBaseEnv(t *testing.T) {
+	t.Helper()
+	os.Setenv("MYSQL_DSN", "user:pass@tcp(localhost:3306)/db")
+	os.Setenv("MYSQL_READER_DSN", "r:p@tcp(localhost:3306)/db")
+	os.Setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	t.Cleanup(func() {
+		os.Unsetenv("MYSQL_DSN")
+		os.Unsetenv("MYSQL_READER_DSN")
+		os.Unsetenv("RABBITMQ_URL")
+	})
+}
+
+// TestLoad_WorkerNoJWT_OK verifies the worker path: Load succeeds with no
+// JWT_SECRET set. JWT is validated separately by the API via ValidateJWT.
+func TestLoad_WorkerNoJWT_OK(t *testing.T) {
+	setBaseEnv(t)
+	os.Unsetenv("JWT_SECRET")
+
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load must succeed without JWT_SECRET (worker path), got %v", err)
+	}
+}
+
+// TestValidateJWT_Valid verifies a >=32-byte secret passes API validation.
+func TestValidateJWT_Valid(t *testing.T) {
+	setBaseEnv(t)
+	os.Setenv("JWT_SECRET", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") // 32 bytes
+	t.Cleanup(func() { os.Unsetenv("JWT_SECRET") })
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.ValidateJWT(); err != nil {
+		t.Errorf("expected valid JWT config, got %v", err)
+	}
+}
+
+// TestValidateJWT_Missing verifies the API rejects an empty JWT_SECRET.
+func TestValidateJWT_Missing(t *testing.T) {
+	setBaseEnv(t)
+	os.Unsetenv("JWT_SECRET")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.ValidateJWT(); err == nil {
+		t.Fatal("expected error when JWT_SECRET is missing, got nil")
+	}
+}
+
+// TestValidateJWT_TooShort verifies a secret under 32 bytes fails API validation.
+func TestValidateJWT_TooShort(t *testing.T) {
+	setBaseEnv(t)
+	os.Setenv("JWT_SECRET", "short-secret") // < 32 bytes
+	t.Cleanup(func() { os.Unsetenv("JWT_SECRET") })
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.ValidateJWT(); err == nil {
+		t.Fatal("expected error when JWT_SECRET is under 32 bytes, got nil")
 	}
 }

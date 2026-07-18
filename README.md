@@ -50,6 +50,10 @@ Copy-Item .env.example .env
 > 阶段 2 新增两个变量：`MYSQL_READER_DSN`（必填，askdb_reader 连接 askdb_demo）和
 > `QUERY_TIMEOUT`（可选，默认 5s）。若沿用旧的 `.env`，需补上 `MYSQL_READER_DSN`，否则 API 启动会失败。
 > 真实环境变量优先，`.env` 仅作为本地开发兜底，且始终被 Git 忽略。
+>
+> 阶段 6A 新增 JWT 配置：`JWT_SECRET`（**仅 API 必填**，至少 32 字节）、`JWT_ISSUER`（可选，默认 `askdb-api`）、
+> `JWT_ACCESS_TTL`（可选，默认 24h）。Worker **不需要也不接触** `JWT_SECRET`，未配置时仍可正常启动。
+> 示例中的 secret 仅为本地开发占位，生产环境必须注入独立的高强度随机值。
 
 ### 3. 执行数据库迁移
 
@@ -126,20 +130,24 @@ docs/adr/         — 技术选型记录（ADR）
 
 ---
 
-## 当前能力（阶段 5）
+## 当前能力（阶段 6A）
+
+在阶段 5 链路之上新增**用户认证与查询任务归属**：注册、登录、JWT Bearer 鉴权，查询任务按用户隔离。
 
 打通 **RabbitMQ 异步 + SQL Guard + Redis 结果缓存**完整链路：
 
-1. API 接收问题，创建任务，发布消息到 RabbitMQ，立即返回 **HTTP 202**
-2. Worker 消费消息，调用 Fake LLM 生成 SQL
-3. **SQL Guard** 通过 AST 解析验证并规范化 SQL（状态：`validating`）
-4. Guard 拒绝的 SQL 直接标记为 failed，不执行查询
-5. Guard 通过的 SQL 由 QueryExecutor 只读查询演示库
-6. 结果序列化后检查大小限制（MAX_RESULT_BYTES），超限标记 failed
-7. Worker 将完整结果写入 **Redis**（TTL 默认 15 分钟）
-8. Redis 写入成功后，Worker 将 MySQL 任务更新为 succeeded，然后 ACK
-9. 客户端通过 `GET /api/v1/query-jobs/:id` 轮询任务状态
-10. 任务成功后，客户端调用 `GET /api/v1/query-jobs/:id/result` 获取完整结果
+1. 客户端注册并登录，获取 JWT（HS256），后续携带 `Authorization: Bearer <token>` 访问受保护接口
+2. API 校验 Bearer Token，从 `sub` 解析出用户 ID
+3. API 接收问题，创建归属当前用户的任务，发布消息到 RabbitMQ，立即返回 **HTTP 202**
+4. Worker 消费消息，调用 Fake LLM 生成 SQL
+5. **SQL Guard** 通过 AST 解析验证并规范化 SQL（状态：`validating`）
+6. Guard 拒绝的 SQL 直接标记为 failed，不执行查询
+7. Guard 通过的 SQL 由 QueryExecutor 只读查询演示库
+8. 结果序列化后检查大小限制（MAX_RESULT_BYTES），超限标记 failed
+9. Worker 将完整结果写入 **Redis**（TTL 默认 15 分钟）
+10. Redis 写入成功后，Worker 将 MySQL 任务更新为 succeeded，然后 ACK
+11. 客户端通过 `GET /api/v1/query-jobs/:id` 轮询任务状态（仅本人任务可见）
+12. 任务成功后，客户端调用 `GET /api/v1/query-jobs/:id/result` 获取完整结果（仅本人任务可读）
 
 **MySQL 是任务状态的唯一事实来源**。Redis 仅作短期结果缓存。QueryExecutor 永远只接收 Guard 规范化后的 SQL，永远不执行原始 LLM 输出。
 
@@ -150,6 +158,9 @@ docs/adr/         — 技术选型记录（ADR）
 - 发布消息不使用 Publisher Confirm，存在已知双写风险（见架构说明）。
 - 不保证 Exactly Once 消费。
 - SQL Guard 是纵深防御，不替代 askdb_reader 的数据库只读权限。
+- **认证仅提供注册、登录与单一 access token（HS256）**：不支持刷新 Token、登出/吊销、RBAC 角色权限、OAuth 或第三方登录。
+- Token 一经签发在有效期内始终有效，无法主动失效；`JWT_ACCESS_TTL` 默认 24h。
+- `query_jobs.user_id` 对历史行为 NULL，这些遗留任务不属于任何用户，任何登录用户访问均返回 404。
 
 Fake LLM 目前支持的固定问题：`查询所有商品`、`查询销量最高的商品`、`查询最近的订单`。
 
@@ -166,27 +177,62 @@ docker compose --profile migrate run --rm migrate
 
 | Method | Path | 描述 |
 |---|---|---|
-| GET | /healthz | 存活探针，永远 200 |
-| GET | /readyz | 就绪探针，依赖全部就绪返回 200，否则 503 |
-| POST | /api/v1/query-jobs | 提交自然语言问题，异步创建任务，返回 202 |
-| GET | /api/v1/query-jobs/:id | 轮询任务状态，succeeded 时包含 result_expires_at |
-| GET | /api/v1/query-jobs/:id/result | 获取完整查询结果（columns / rows），仅 succeeded 且缓存有效时返回 200 |
+| GET | /healthz | 存活探针，永远 200（公开） |
+| GET | /readyz | 就绪探针，依赖全部就绪返回 200，否则 503（公开） |
+| POST | /api/v1/auth/register | 注册，成功 201，邮箱重复 409（公开） |
+| POST | /api/v1/auth/login | 登录，成功 200 返回 JWT，凭证错误 401（公开） |
+| POST | /api/v1/query-jobs | 提交自然语言问题，异步创建任务，返回 202（需 Bearer） |
+| GET | /api/v1/query-jobs/:id | 轮询任务状态，succeeded 时包含 result_expires_at（需 Bearer） |
+| GET | /api/v1/query-jobs/:id/result | 获取完整查询结果（columns / rows），仅 succeeded 且缓存有效时返回 200（需 Bearer） |
+
+受保护接口需携带 `Authorization: Bearer <token>`。缺失、过期、算法非 HS256 或 issuer 不符均返回 **401**。任务按 `user_id` 隔离：访问不存在、他人或历史 NULL 归属的任务，一律返回 **404**（不区分，避免 IDOR 探测）。
+
+认证错误码：
+
+| HTTP | error | 含义 |
+|---|---|---|
+| 400 | INVALID_EMAIL | 邮箱格式非法 |
+| 400 | INVALID_PASSWORD | 密码字节长度不在 8–72 |
+| 409 | EMAIL_ALREADY_REGISTERED | 邮箱已注册 |
+| 401 | INVALID_CREDENTIALS | 邮箱或密码错误（不区分，防枚举） |
+| 401 | unauthorized | Token 缺失、过期、算法/issuer 不符 |
+
+### 认证与任务归属（阶段 6A）
+
+- 注册与登录为公开接口；三个 `query-jobs` 接口受 Bearer 中间件保护，缺失或非法 Token 返回 401。
+- 登录成功返回 JWT（HS256，标准 `sub` 存用户 ID，含 `iss`/`iat`/`exp`）。
+- 任务创建时写入 `user_id`；查询状态与结果先在 MySQL 校验归属，再读 Redis。
+- **不存在的任务、他人任务、历史 `user_id=NULL` 任务对外一律返回 404**，不泄露存在性。
+- 密码按字节长度限制 8～72，不做 trim；重复邮箱返回 409；凭证错误统一返回 401。
+- **本阶段不支持刷新 Token、RBAC、OAuth**；Token 到期需重新登录。
 
 ### 请求示例
 
 ```powershell
-# 提交问题（返回 202）
-$resp = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/query-jobs `
+# 注册（返回 201）
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/auth/register `
   -ContentType "application/json" `
+  -Body '{"email":"a@example.com","password":"pass1234"}'
+
+# 登录取 Token（返回 200）
+$login = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/auth/login `
+  -ContentType "application/json" `
+  -Body '{"email":"a@example.com","password":"pass1234"}'
+$token = $login.token
+$headers = @{ Authorization = "Bearer $token" }
+
+# 提交问题（返回 202，需携带 Token）
+$resp = Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/v1/query-jobs `
+  -ContentType "application/json" -Headers $headers `
   -Body '{"question":"查询所有商品"}'
 $jobId = $resp.job_id
 
 # 轮询任务状态
 Start-Sleep 2
-Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId"
+Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId" -Headers $headers
 
 # 获取完整结果
-Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId/result"
+Invoke-RestMethod -Uri "http://localhost:8080/api/v1/query-jobs/$jobId/result" -Headers $headers
 ```
 
 202 响应：

@@ -2,6 +2,7 @@ package queryjob
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -133,7 +134,7 @@ func TestService_Submit_Success(t *testing.T) {
 	pub := &fakePublisher{}
 	svc := NewService(repo, pub)
 
-	job, err := svc.Submit(context.Background(), "  查询所有商品  ")
+	job, err := svc.Submit(context.Background(), 1, "  查询所有商品  ")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -158,7 +159,7 @@ func TestService_Submit_InvalidQuestion(t *testing.T) {
 	svc := NewService(repo, pub)
 
 	for _, q := range []string{"", "   "} {
-		_, err := svc.Submit(context.Background(), q)
+		_, err := svc.Submit(context.Background(), 1, q)
 		var svcErr *ServiceError
 		if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInvalidQuestion {
 			t.Errorf("question %q: expected INVALID_QUESTION, got %v", q, err)
@@ -177,7 +178,7 @@ func TestService_Submit_CreateFailure(t *testing.T) {
 	pub := &fakePublisher{}
 	svc := NewService(repo, pub)
 
-	_, err := svc.Submit(context.Background(), "查询所有商品")
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品")
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
 		t.Errorf("expected INTERNAL_ERROR, got %v", err)
@@ -192,7 +193,7 @@ func TestService_Submit_TransitionQueuedFailure(t *testing.T) {
 	pub := &fakePublisher{}
 	svc := NewService(repo, pub)
 
-	_, err := svc.Submit(context.Background(), "查询所有商品")
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品")
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
 		t.Errorf("expected INTERNAL_ERROR, got %v", err)
@@ -207,7 +208,7 @@ func TestService_Submit_PublishFailure(t *testing.T) {
 	pub := &fakePublisher{publishErr: errors.New("broker unavailable")}
 	svc := NewService(repo, pub)
 
-	_, err := svc.Submit(context.Background(), "查询所有商品")
+	_, err := svc.Submit(context.Background(), 1, "查询所有商品")
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodePublishFailed {
 		t.Errorf("expected PUBLISH_FAILED, got %v", err)
@@ -228,18 +229,18 @@ func TestService_Get_NotFound(t *testing.T) {
 	repo := &fakeRepo{findErr: ErrJobNotFound}
 	svc := NewService(repo, &fakePublisher{})
 
-	_, err := svc.Get(context.Background(), 99)
+	_, err := svc.Get(context.Background(), 1, 99)
 	if !errors.Is(err, ErrJobNotFound) {
 		t.Errorf("expected ErrJobNotFound, got %v", err)
 	}
 }
 
 func TestService_Get_Success(t *testing.T) {
-	want := &QueryJob{ID: 7, Status: string(StatusSucceeded)}
+	want := &QueryJob{ID: 7, Status: string(StatusSucceeded), UserID: sql.NullInt64{Int64: 7, Valid: true}}
 	repo := &fakeRepo{findResult: want}
 	svc := NewService(repo, &fakePublisher{})
 
-	got, err := svc.Get(context.Background(), 7)
+	got, err := svc.Get(context.Background(), 7, 7)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -534,9 +535,11 @@ func TestWorkerService_Process_UnsupportedQuestion_NoRedisWrite(t *testing.T) {
 type fakeResultReader struct {
 	getResult *queryresult.CachedQueryResult
 	getErr    error
+	getCalled bool
 }
 
 func (f *fakeResultReader) Get(_ context.Context, _ uint64) (*queryresult.CachedQueryResult, error) {
+	f.getCalled = true
 	return f.getResult, f.getErr
 }
 
@@ -544,6 +547,8 @@ func succeededJob(resultExpiresAt *time.Time) *QueryJob {
 	job := &QueryJob{ID: 5, Status: string(StatusSucceeded)}
 	job.GeneratedSQL.String = "SELECT 1"
 	job.GeneratedSQL.Valid = true
+	// owner=5; ownership checks in service tests use callerID=5.
+	job.UserID = sql.NullInt64{Int64: 5, Valid: true}
 	if resultExpiresAt != nil {
 		job.ResultExpiresAt.Time = *resultExpiresAt
 		job.ResultExpiresAt.Valid = true
@@ -552,10 +557,11 @@ func succeededJob(resultExpiresAt *time.Time) *QueryJob {
 }
 
 func TestResultService_GetResult_PendingTask(t *testing.T) {
-	repo := &fakeRepo{findResult: &QueryJob{ID: 1, Status: string(StatusQueued)}}
+	job := &QueryJob{ID: 1, Status: string(StatusQueued), UserID: sql.NullInt64{Int64: 1, Valid: true}}
+	repo := &fakeRepo{findResult: job}
 	svc := NewResultService(repo, &fakeResultReader{})
 
-	_, err := svc.GetResult(context.Background(), 1)
+	_, err := svc.GetResult(context.Background(), 1, 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultNotReady {
 		t.Errorf("expected RESULT_NOT_READY, got %v", err)
@@ -564,10 +570,11 @@ func TestResultService_GetResult_PendingTask(t *testing.T) {
 
 func TestResultService_GetResult_FailedTask(t *testing.T) {
 	store := &fakeResultReader{}
-	repo := &fakeRepo{findResult: &QueryJob{ID: 1, Status: string(StatusFailed)}}
+	job := &QueryJob{ID: 1, Status: string(StatusFailed), UserID: sql.NullInt64{Int64: 1, Valid: true}}
+	repo := &fakeRepo{findResult: job}
 	svc := NewResultService(repo, store)
 
-	_, err := svc.GetResult(context.Background(), 1)
+	_, err := svc.GetResult(context.Background(), 1, 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeQueryJobFailed {
 		t.Errorf("expected QUERY_JOB_FAILED, got %v", err)
@@ -582,7 +589,7 @@ func TestResultService_GetResult_Succeeded_NullExpiresAt(t *testing.T) {
 	repo := &fakeRepo{findResult: succeededJob(nil)}
 	svc := NewResultService(repo, &fakeResultReader{})
 
-	_, err := svc.GetResult(context.Background(), 5)
+	_, err := svc.GetResult(context.Background(), 5, 5)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultUnavailable {
 		t.Errorf("expected RESULT_UNAVAILABLE when result_expires_at is NULL, got %v", err)
@@ -598,7 +605,7 @@ func TestResultService_GetResult_Succeeded_CacheHit(t *testing.T) {
 	store := &fakeResultReader{getResult: cached}
 	svc := NewResultService(repo, store)
 
-	got, err := svc.GetResult(context.Background(), 5)
+	got, err := svc.GetResult(context.Background(), 5, 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -613,7 +620,7 @@ func TestResultService_GetResult_CacheExpired(t *testing.T) {
 	store := &fakeResultReader{getErr: queryresult.ErrResultNotFound}
 	svc := NewResultService(repo, store)
 
-	_, err := svc.GetResult(context.Background(), 5)
+	_, err := svc.GetResult(context.Background(), 5, 5)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultExpired {
 		t.Errorf("expected RESULT_EXPIRED, got %v", err)
@@ -626,7 +633,7 @@ func TestResultService_GetResult_CachePrematureLoss(t *testing.T) {
 	store := &fakeResultReader{getErr: queryresult.ErrResultNotFound}
 	svc := NewResultService(repo, store)
 
-	_, err := svc.GetResult(context.Background(), 5)
+	_, err := svc.GetResult(context.Background(), 5, 5)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultUnavailable {
 		t.Errorf("expected RESULT_UNAVAILABLE on premature cache loss, got %v", err)
@@ -639,7 +646,7 @@ func TestResultService_GetResult_StoreUnavailable(t *testing.T) {
 	store := &fakeResultReader{getErr: queryresult.ErrResultStoreUnavailable}
 	svc := NewResultService(repo, store)
 
-	_, err := svc.GetResult(context.Background(), 5)
+	_, err := svc.GetResult(context.Background(), 5, 5)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultStoreUnavail {
 		t.Errorf("expected RESULT_STORE_UNAVAILABLE, got %v", err)
@@ -652,7 +659,7 @@ func TestResultService_GetResult_CorruptedCache(t *testing.T) {
 	store := &fakeResultReader{getErr: queryresult.ErrResultCorrupted}
 	svc := NewResultService(repo, store)
 
-	_, err := svc.GetResult(context.Background(), 5)
+	_, err := svc.GetResult(context.Background(), 5, 5)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeResultCorrupted {
 		t.Errorf("expected RESULT_CORRUPTED, got %v", err)
@@ -663,7 +670,7 @@ func TestResultService_GetResult_NotFound(t *testing.T) {
 	repo := &fakeRepo{findErr: ErrJobNotFound}
 	svc := NewResultService(repo, &fakeResultReader{})
 
-	_, err := svc.GetResult(context.Background(), 99)
+	_, err := svc.GetResult(context.Background(), 1, 99)
 	if !errors.Is(err, ErrJobNotFound) {
 		t.Errorf("expected ErrJobNotFound, got %v", err)
 	}
@@ -677,7 +684,7 @@ func TestResultService_GetResult_NoRedisKey_NotExposed(t *testing.T) {
 	store := &fakeResultReader{getErr: queryresult.ErrResultNotFound}
 	svc := NewResultService(repo, store)
 
-	_, err := svc.GetResult(context.Background(), 42)
+	_, err := svc.GetResult(context.Background(), 5, 5)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -834,3 +841,81 @@ func TestWorkerService_Process_ResultTooLarge(t *testing.T) {
 
 // l0 returns a fakeLLM producing a benign SELECT for tests that don't care.
 func l0() *fakeLLM { return &fakeLLM{sql: "SELECT id FROM products"} }
+
+// --- Phase 6A: ownership (IDOR) tests ---
+
+func TestService_Submit_SetsUserID(t *testing.T) {
+	repo := &fakeRepo{}
+	svc := NewService(repo, &fakePublisher{})
+
+	_, err := svc.Submit(context.Background(), 42, "查询所有商品")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if repo.created == nil {
+		t.Fatal("expected Create to be called")
+	}
+	if !repo.created.UserID.Valid || uint64(repo.created.UserID.Int64) != 42 {
+		t.Errorf("UserID: got %+v, want {Int64:42 Valid:true}", repo.created.UserID)
+	}
+}
+
+func TestService_Get_WrongOwner_NotFound(t *testing.T) {
+	job := &QueryJob{ID: 3, Status: string(StatusSucceeded), UserID: sql.NullInt64{Int64: 10, Valid: true}}
+	repo := &fakeRepo{findResult: job}
+	svc := NewService(repo, &fakePublisher{})
+
+	// callerID=99 != job.UserID=10 → must return ErrJobNotFound
+	_, err := svc.Get(context.Background(), 99, 3)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("expected ErrJobNotFound on wrong owner, got %v", err)
+	}
+}
+
+func TestService_Get_NullUserID_NotFound(t *testing.T) {
+	// Legacy row with NULL user_id must be inaccessible to any caller.
+	job := &QueryJob{ID: 3, Status: string(StatusSucceeded)}
+	repo := &fakeRepo{findResult: job}
+	svc := NewService(repo, &fakePublisher{})
+
+	_, err := svc.Get(context.Background(), 10, 3)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("expected ErrJobNotFound for legacy NULL user_id, got %v", err)
+	}
+}
+
+func TestResultService_GetResult_WrongOwner_NoRedis(t *testing.T) {
+	store := &fakeResultReader{}
+	exp := time.Now().UTC().Add(10 * time.Minute)
+	job := succeededJob(&exp) // UserID=5
+	repo := &fakeRepo{findResult: job}
+	svc := NewResultService(repo, store)
+
+	// callerID=99 != job.UserID=5 → must return 404 without reading Redis
+	_, err := svc.GetResult(context.Background(), 99, 5)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("expected ErrJobNotFound on wrong owner, got %v", err)
+	}
+	if store.getCalled {
+		t.Error("Redis must not be accessed when ownership check fails")
+	}
+}
+
+func TestResultService_GetResult_NullUserID_NoRedis(t *testing.T) {
+	store := &fakeResultReader{}
+	exp := time.Now().UTC().Add(10 * time.Minute)
+	// Legacy job: no UserID set.
+	job := &QueryJob{ID: 5, Status: string(StatusSucceeded)}
+	job.GeneratedSQL = sql.NullString{String: "SELECT 1", Valid: true}
+	job.ResultExpiresAt = sql.NullTime{Time: exp, Valid: true}
+	repo := &fakeRepo{findResult: job}
+	svc := NewResultService(repo, store)
+
+	_, err := svc.GetResult(context.Background(), 5, 5)
+	if !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("expected ErrJobNotFound for legacy NULL user_id, got %v", err)
+	}
+	if store.getCalled {
+		t.Error("Redis must not be accessed for legacy NULL user_id jobs")
+	}
+}

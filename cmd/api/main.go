@@ -12,11 +12,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Yangsss13/askdb-go/internal/auth"
 	"github.com/Yangsss13/askdb-go/internal/config"
 	"github.com/Yangsss13/askdb-go/internal/handler"
 	"github.com/Yangsss13/askdb-go/internal/infra"
+	"github.com/Yangsss13/askdb-go/internal/middleware"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
 	"github.com/Yangsss13/askdb-go/internal/queryresult"
+	"github.com/Yangsss13/askdb-go/internal/user"
 )
 
 func main() {
@@ -25,6 +28,12 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("config load failed", "err", err)
+		os.Exit(1)
+	}
+
+	// JWT is required for the API only; the worker starts without it.
+	if err := cfg.ValidateJWT(); err != nil {
+		slog.Error("jwt config invalid", "err", err)
 		os.Exit(1)
 	}
 
@@ -66,6 +75,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --- auth wiring ---
+	jwtMgr := auth.NewJWTManager(cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTAccessTTL)
+	userRepo := user.NewGORMRepository(db.GORM)
+	authSvc := user.NewAuthService(userRepo, jwtMgr)
+	authHandler := user.NewAuthHandler(authSvc)
+
 	// --- query-job wiring ---
 	repo := queryjob.NewGORMRepository(db.GORM)
 	resultStore := queryresult.NewRedisStore(rdb)
@@ -84,11 +99,20 @@ func main() {
 		Rabbit: mq,
 	}))
 
+	// Public auth routes — no Bearer middleware.
 	v1 := r.Group("/api/v1")
+	auth1 := v1.Group("/auth")
 	{
-		v1.POST("/query-jobs", queryHandler.Submit)
-		v1.GET("/query-jobs/:id", queryHandler.Get)
-		v1.GET("/query-jobs/:id/result", queryHandler.GetResult)
+		auth1.POST("/register", authHandler.Register)
+		auth1.POST("/login", authHandler.Login)
+	}
+
+	// Protected query-job routes — Bearer middleware enforces authentication.
+	protected := v1.Group("/", middleware.Bearer(jwtMgr))
+	{
+		protected.POST("/query-jobs", queryHandler.Submit)
+		protected.GET("/query-jobs/:id", queryHandler.Get)
+		protected.GET("/query-jobs/:id/result", queryHandler.GetResult)
 	}
 
 	srv := &http.Server{

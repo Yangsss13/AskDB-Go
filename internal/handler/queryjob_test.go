@@ -25,12 +25,12 @@ type stubService struct {
 	getErr       error
 }
 
-func (s *stubService) Submit(_ context.Context, _ string) (*queryjob.QueryJob, error) {
+func (s *stubService) Submit(_ context.Context, _ uint64, _ string) (*queryjob.QueryJob, error) {
 	s.submitCalled = true
 	return s.submitResult, s.submitErr
 }
 
-func (s *stubService) Get(_ context.Context, _ uint64) (*queryjob.QueryJob, error) {
+func (s *stubService) Get(_ context.Context, _ uint64, _ uint64) (*queryjob.QueryJob, error) {
 	return s.getResult, s.getErr
 }
 
@@ -40,13 +40,14 @@ type stubResultService struct {
 	err    error
 }
 
-func (s *stubResultService) GetResult(_ context.Context, _ uint64) (*queryresult.CachedQueryResult, error) {
+func (s *stubResultService) GetResult(_ context.Context, _ uint64, _ uint64) (*queryresult.CachedQueryResult, error) {
 	return s.result, s.err
 }
 
 func setupRouter(svc queryJobService) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	r.Use(injectUserID(1))
 	h := NewQueryJobHandler(svc, &stubResultService{})
 	v1 := r.Group("/api/v1")
 	v1.POST("/query-jobs", h.Submit)
@@ -58,12 +59,22 @@ func setupRouter(svc queryJobService) *gin.Engine {
 func setupRouterWithResult(svc queryJobService, rSvc queryResultService) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	r.Use(injectUserID(1))
 	h := NewQueryJobHandler(svc, rSvc)
 	v1 := r.Group("/api/v1")
 	v1.POST("/query-jobs", h.Submit)
 	v1.GET("/query-jobs/:id", h.Get)
 	v1.GET("/query-jobs/:id/result", h.GetResult)
 	return r
+}
+
+// injectUserID is a test-only middleware that sets a fixed user ID in context,
+// replacing the Bearer middleware without needing a real JWT.
+func injectUserID(uid uint64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("userID", uid)
+		c.Next()
+	}
 }
 
 func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder {

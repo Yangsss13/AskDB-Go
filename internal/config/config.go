@@ -46,11 +46,25 @@ type Config struct {
 
 	// RabbitMQ — URL must not be logged
 	RabbitMQURL string
+
+	// JWTSecret is the HS256 signing key. Configured via JWT_SECRET.
+	// Required only by the API (see ValidateJWT); the Worker never uses it.
+	JWTSecret []byte
+
+	// JWTIssuer is the "iss" claim value. Configured via JWT_ISSUER (default "askdb-api").
+	JWTIssuer string
+
+	// JWTAccessTTL is the token validity window. Configured via JWT_ACCESS_TTL (default 24h).
+	JWTAccessTTL time.Duration
 }
 
 // Load reads the .env file (if present) as a fallback, then reads environment
 // variables. Real environment variables always override .env values.
 // Returns an error if any required variable is missing.
+//
+// Load validates only the configuration shared by both processes. JWT settings
+// are validated separately by ValidateJWT, which the API calls but the Worker
+// does not — the Worker never touches JWT_SECRET.
 func Load() (*Config, error) {
 	// godotenv.Load silently ignores a missing .env file, which is intentional:
 	// production environments supply variables through the process environment.
@@ -67,6 +81,9 @@ func Load() (*Config, error) {
 		MaxQueryRows:   getIntEnv("MAX_QUERY_ROWS", 100),
 		MaxResultBytes: getInt64Env("MAX_RESULT_BYTES", 1048576),
 		RabbitMQURL:    os.Getenv("RABBITMQ_URL"),
+		JWTSecret:      []byte(os.Getenv("JWT_SECRET")),
+		JWTIssuer:      getEnv("JWT_ISSUER", "askdb-api"),
+		JWTAccessTTL:   getDurationEnv("JWT_ACCESS_TTL", 24*time.Hour),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -98,6 +115,19 @@ func (c *Config) validate() error {
 	}
 	if c.MaxResultBytes <= 0 {
 		return fmt.Errorf("config: MAX_RESULT_BYTES must be greater than zero, got %d", c.MaxResultBytes)
+	}
+	return nil
+}
+
+// ValidateJWT checks the JWT configuration. It is API-only: the worker never
+// signs or verifies tokens and must start without JWT_SECRET set. The API calls
+// this after Load and exits on error.
+func (c *Config) ValidateJWT() error {
+	if len(c.JWTSecret) == 0 {
+		return fmt.Errorf("config: missing required environment variable: JWT_SECRET")
+	}
+	if len(c.JWTSecret) < 32 {
+		return fmt.Errorf("config: JWT_SECRET must be at least 32 bytes, got %d", len(c.JWTSecret))
 	}
 	return nil
 }

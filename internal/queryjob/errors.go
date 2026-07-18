@@ -25,6 +25,9 @@ const (
 	// Phase 5: SQL Guard and resource-limit error codes.
 	ErrCodeSQLValidationFailed = "SQL_VALIDATION_FAILED"
 	ErrCodeResultTooLarge      = "RESULT_TOO_LARGE"
+
+	// Phase 6A: ownership / auth error codes.
+	ErrCodeJobNotOwned = "JOB_NOT_FOUND" // same as not-found to avoid IDOR leakage
 )
 
 // Safe, client-facing messages paired with the codes above.

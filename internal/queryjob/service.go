@@ -2,6 +2,7 @@ package queryjob
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"time"
@@ -57,18 +58,18 @@ func NewService(repo Repository, pub Publisher) *Service {
 	return &Service{repo: repo, pub: pub, now: time.Now}
 }
 
-// Submit validates the question, creates a pending job, conditionally advances
-// it to queued, and publishes a message. It returns the job snapshot on
-// success (HTTP 202) or a ServiceError on any failure.
+// Submit validates the question, creates a pending job owned by userID,
+// conditionally advances it to queued, and publishes a message. It returns
+// the job snapshot on success (HTTP 202) or a ServiceError on any failure.
 //
 // Order of operations (prevents the Worker from winning a race against the API):
 //
 //  1. Validate question → 400 on fail, no job created
-//  2. Create job (pending) → 500 on fail, no message published
+//  2. Create job (pending, userID set) → 500 on fail, no message published
 //  3. TransitionStatus pending→queued → 500 on fail, no message published
 //  4. Publish → on fail: SetFailed queued→failed, return 503
 //  5. Return job snapshot (status=queued)
-func (s *Service) Submit(ctx context.Context, question string) (*QueryJob, error) {
+func (s *Service) Submit(ctx context.Context, userID uint64, question string) (*QueryJob, error) {
 	trimmed := strings.TrimSpace(question)
 	if trimmed == "" || len([]rune(trimmed)) > maxQuestionLen {
 		return nil, newServiceError(ErrCodeInvalidQuestion, "question must be 1-500 characters")
@@ -80,6 +81,7 @@ func (s *Service) Submit(ctx context.Context, question string) (*QueryJob, error
 		Status:    string(StatusPending),
 		CreatedAt: now,
 		UpdatedAt: now,
+		UserID:    sql.NullInt64{Int64: int64(userID), Valid: true},
 	}
 	if err := s.repo.Create(ctx, job); err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
@@ -103,9 +105,18 @@ func (s *Service) Submit(ctx context.Context, question string) (*QueryJob, error
 	return job, nil
 }
 
-// Get returns the persisted job by ID, or ErrJobNotFound when absent.
-func (s *Service) Get(ctx context.Context, id uint64) (*QueryJob, error) {
-	return s.repo.FindByID(ctx, id)
+// Get returns the persisted job by ID for the given caller.
+// Returns ErrJobNotFound when the job is absent or belongs to a different user
+// (including NULL legacy rows), preventing IDOR leakage.
+func (s *Service) Get(ctx context.Context, callerID uint64, id uint64) (*QueryJob, error) {
+	job, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ownsJob(job, callerID) {
+		return nil, ErrJobNotFound
+	}
+	return job, nil
 }
 
 // ResultService retrieves cached query results. It always checks MySQL first
@@ -121,12 +132,17 @@ func NewResultService(repo Repository, store ResultReader) *ResultService {
 	return &ResultService{repo: repo, store: store, now: time.Now}
 }
 
-// GetResult fetches the cached query result for a succeeded job.
-// It checks MySQL for the job status before reading Redis.
-func (s *ResultService) GetResult(ctx context.Context, jobID uint64) (*queryresult.CachedQueryResult, error) {
+// GetResult fetches the cached query result for a succeeded job owned by callerID.
+// Ownership is checked against MySQL before any Redis access is attempted.
+func (s *ResultService) GetResult(ctx context.Context, callerID uint64, jobID uint64) (*queryresult.CachedQueryResult, error) {
 	job, err := s.repo.FindByID(ctx, jobID)
 	if err != nil {
 		return nil, err // ErrJobNotFound propagates to handler
+	}
+
+	// Ownership check: NULL user_id (legacy rows) and mismatched owner both return 404.
+	if !ownsJob(job, callerID) {
+		return nil, ErrJobNotFound
 	}
 
 	status := Status(job.Status)
@@ -169,4 +185,10 @@ func (s *ResultService) mapStoreError(err error, job *QueryJob) *ServiceError {
 	default:
 		return newServiceError(ErrCodeResultStoreUnavail, "result store is unavailable")
 	}
+}
+
+// ownsJob reports whether callerID is the owner of job.
+// Returns false for legacy rows (NULL user_id) and mismatched owners.
+func ownsJob(job *QueryJob, callerID uint64) bool {
+	return job.UserID.Valid && uint64(job.UserID.Int64) == callerID
 }

@@ -9,19 +9,20 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Yangsss13/askdb-go/internal/middleware"
 	"github.com/Yangsss13/askdb-go/internal/queryjob"
 	"github.com/Yangsss13/askdb-go/internal/queryresult"
 )
 
 // queryJobService is the narrow service dependency for job submission and status.
 type queryJobService interface {
-	Submit(ctx context.Context, question string) (*queryjob.QueryJob, error)
-	Get(ctx context.Context, id uint64) (*queryjob.QueryJob, error)
+	Submit(ctx context.Context, userID uint64, question string) (*queryjob.QueryJob, error)
+	Get(ctx context.Context, userID uint64, id uint64) (*queryjob.QueryJob, error)
 }
 
 // queryResultService is the narrow service dependency for result retrieval.
 type queryResultService interface {
-	GetResult(ctx context.Context, jobID uint64) (*queryresult.CachedQueryResult, error)
+	GetResult(ctx context.Context, userID uint64, jobID uint64) (*queryresult.CachedQueryResult, error)
 }
 
 // submitRequest is the POST body.
@@ -91,7 +92,7 @@ func (h *QueryJobHandler) Submit(c *gin.Context) {
 		return
 	}
 
-	job, err := h.svc.Submit(c.Request.Context(), req.Question)
+	job, err := h.svc.Submit(c.Request.Context(), middleware.UserID(c), req.Question)
 	if err != nil {
 		var svcErr *queryjob.ServiceError
 		if errors.As(err, &svcErr) {
@@ -126,7 +127,7 @@ func (h *QueryJobHandler) Get(c *gin.Context) {
 		return
 	}
 
-	job, err := h.svc.Get(c.Request.Context(), id)
+	job, err := h.svc.Get(c.Request.Context(), middleware.UserID(c), id)
 	if err != nil {
 		if errors.Is(err, queryjob.ErrJobNotFound) {
 			c.JSON(http.StatusNotFound, errorResponse{
@@ -157,7 +158,7 @@ func (h *QueryJobHandler) GetResult(c *gin.Context) {
 		return
 	}
 
-	result, err := h.resultSvc.GetResult(c.Request.Context(), id)
+	result, err := h.resultSvc.GetResult(c.Request.Context(), middleware.UserID(c), id)
 	if err != nil {
 		if errors.Is(err, queryjob.ErrJobNotFound) {
 			c.JSON(http.StatusNotFound, errorResponse{

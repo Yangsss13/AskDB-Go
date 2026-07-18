@@ -23,6 +23,9 @@ type QueryJob struct {
 	// ResultExpiresAt is when the Redis-cached result expires.
 	// NULL means the job has not succeeded yet, or caching was not written.
 	ResultExpiresAt sql.NullTime `gorm:"column:result_expires_at"`
+	// UserID is the owner of this job. NULL for pre-auth legacy rows;
+	// the application layer enforces non-NULL for all new jobs.
+	UserID sql.NullInt64 `gorm:"column:user_id"`
 }
 
 // TableName pins the table name so GORM does not pluralize unexpectedly.
