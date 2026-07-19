@@ -180,10 +180,27 @@
 
 ---
 
-### 阶段 8：Transactional Outbox 与 Exactly-Once（下一阶段）
+### 阶段 8：Transactional Outbox（已完成；At-Least-Once）
 
-**目标**：围绕数据库事务与消息发布一致性，设计并实现 Transactional Outbox，并在明确边界后推进 Exactly-Once 语义。
+**目标**：围绕数据库事务与消息发布一致性实现 Transactional Outbox；本阶段明确不实现 Exactly Once。
 
-- [ ] Transactional Outbox：将任务状态变更与待发布事件写入同一数据库事务
-- [ ] Outbox Relay：可靠发布、重试、确认与投递状态管理
-- [ ] 在 At-Least-Once 基础上评估并实现可验证的 Exactly-Once 处理边界
+- [x] Transactional Outbox：创建任务、`pending→queued` 与待发布事件写入同一 MySQL 事务
+- [x] Outbox Dispatcher：API 进程后台运行，多实例 `SKIP LOCKED` 竞争、Lease 接管、优雅关闭与过期恢复
+- [x] RabbitMQ Confirm、`mandatory=true`、Basic.Return、稳定 `message_id/occurred_at/payload` 与数据库指数退避
+- [x] RabbitMQ 不可用时仍可提交并返回 202；Worker Retry/DLQ 保持阶段 7 语义
+- [x] 仅清理保留期后的 `published` 事件，不永久丢弃未发布事件
+
+**可靠性边界**：Confirm 成功但标记 `published` 前崩溃允许重复发布，由阶段 7 消费者幂等兜底；系统仍是 At-Least-Once，不实现 Exactly Once。真实 LLM 与前端不在本阶段范围内。
+### Phase 8 implementation status: Transactional Outbox
+
+- [x] Migration `000009_create_outbox_events`: durable event payload, unique `message_id`, status, retry time, lease token/expiry, and published retention cleanup.
+- [x] One MySQL transaction creates the query job, moves `pending` to `queued`, and inserts the initial `query.execution.requested` event; rollback removes all three effects.
+- [x] API submission no longer publishes RabbitMQ directly. The API can accept and return 202 while RabbitMQ is unavailable; the in-process Dispatcher reconnects asynchronously.
+- [x] Dispatcher uses `FOR UPDATE SKIP LOCKED`, short claim transactions, lease-token CAS, expired `publishing` takeover, graceful shutdown, Confirm, mandatory routing, and Basic.Return handling.
+- [x] Publish failure uses database `next_retry_at` with capped exponential backoff and never permanently discards an unpublished event. Published rows are cleaned in batches after `OUTBOX_PUBLISHED_RETAIN`.
+- [x] Payload contains only `job_id`; `message_id` and `occurred_at` are stable on republish. Worker Retry/DLQ behavior remains Phase 7 behavior.
+
+The end-to-end contract remains **At-Least-Once**. A crash after RabbitMQ Confirm
+but before `published` can republish the same event; `processed_messages` provides
+consumer idempotency. This phase does **not** implement Exactly Once, a real LLM,
+or a frontend.

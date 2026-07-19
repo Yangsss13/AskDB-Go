@@ -25,6 +25,9 @@ type Repository interface {
 	SetSucceeded(ctx context.Context, id uint64, from Status, generatedSQL string, rowCount, durationMs int64, finishedAt time.Time, resultExpiresAt *time.Time) error
 	// SetFailed atomically writes the failure terminal state.
 	SetFailed(ctx context.Context, id uint64, from Status, errorCode, errorMessage string, finishedAt time.Time) error
+	// CreateAndEnqueue atomically creates a pending job, transitions it to queued,
+	// and inserts an OutboxEvent — all in one MySQL transaction.
+	CreateAndEnqueue(ctx context.Context, job *QueryJob, event *OutboxEvent) error
 }
 
 // DataSourceChecker verifies data-source ownership. Declared on the consuming
@@ -74,21 +77,25 @@ type ProcessService interface {
 }
 
 // Service handles the API side of the query job lifecycle: validate the
-// question, create the job, update it to queued, and publish a message.
+// question, create the job, update it to queued, and insert an outbox event.
+// Publishing to RabbitMQ is decoupled — the Dispatcher handles it in the
+// background so Submit succeeds even when RabbitMQ is unavailable.
 type Service struct {
 	repo    Repository
-	pub     Publisher
+	outbox  OutboxRepository
 	dsCheck DataSourceChecker
 	now     func() time.Time
 }
 
 // NewService wires the API-side service dependencies.
-func NewService(repo Repository, pub Publisher, dsCheck DataSourceChecker) *Service {
-	return &Service{repo: repo, pub: pub, dsCheck: dsCheck, now: time.Now}
+func NewService(repo Repository, outbox OutboxRepository, dsCheck DataSourceChecker) *Service {
+	return &Service{repo: repo, outbox: outbox, dsCheck: dsCheck, now: time.Now}
 }
 
-// Submit validates the question and dataSourceID, creates a pending job owned
-// by userID, advances it to queued, and publishes a message.
+// Submit validates the question and dataSourceID, then atomically creates a
+// pending job, transitions it to queued, and inserts an outbox event — all in
+// one MySQL transaction. Returns immediately after the commit; the Dispatcher
+// will publish the RabbitMQ message in the background.
 func (s *Service) Submit(ctx context.Context, userID uint64, question string, dataSourceID uint64) (*QueryJob, error) {
 	trimmed := strings.TrimSpace(question)
 	if trimmed == "" || len([]rune(trimmed)) > maxQuestionLen {
@@ -115,21 +122,14 @@ func (s *Service) Submit(ctx context.Context, userID uint64, question string, da
 		UserID:       sql.NullInt64{Int64: int64(userID), Valid: true},
 		DataSourceID: sql.NullInt64{Int64: int64(dataSourceID), Valid: true},
 	}
-	if err := s.repo.Create(ctx, job); err != nil {
+	event, err := newOutboxEvent(0, newMessageID(), now) // JobID set inside CreateAndEnqueue
+	if err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
 
-	if err := s.repo.TransitionStatus(ctx, job.ID, StatusPending, StatusQueued); err != nil {
+	if err := s.repo.CreateAndEnqueue(ctx, job, event); err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
-	job.Status = string(StatusQueued)
-
-	if err := s.pub.Publish(ctx, job.ID); err != nil {
-		finished := s.now()
-		_ = s.repo.SetFailed(ctx, job.ID, StatusQueued, ErrCodePublishFailed, msgPublishFailed, finished)
-		return nil, newServiceError(ErrCodePublishFailed, msgPublishFailed)
-	}
-
 	return job, nil
 }
 

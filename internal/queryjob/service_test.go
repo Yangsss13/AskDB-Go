@@ -40,11 +40,42 @@ type fakeRepo struct {
 
 	setRetryingCalled bool
 	setRetryingErr    error
+
+	createAndEnqueueErr    error
+	createAndEnqueueCalled bool
 }
 
 func (f *fakeRepo) SetRetrying(_ context.Context, _ uint64, _ Status, _ uint8, _ time.Time) error {
 	f.setRetryingCalled = true
 	return f.setRetryingErr
+}
+
+func (f *fakeRepo) CreateAndEnqueue(_ context.Context, job *QueryJob, _ *OutboxEvent) error {
+	f.createAndEnqueueCalled = true
+	if f.createAndEnqueueErr != nil {
+		return f.createAndEnqueueErr
+	}
+	f.nextID++
+	job.ID = f.nextID
+	job.Status = string(StatusQueued)
+	f.created = job
+	return nil
+}
+
+// fakeOutboxRepo is a no-op OutboxRepository for tests that don't exercise outbox paths.
+type fakeOutboxRepo struct{}
+
+func (f *fakeOutboxRepo) ClaimBatch(_ context.Context, _ int, _ time.Duration, _ time.Time) ([]OutboxEvent, error) {
+	return nil, nil
+}
+func (f *fakeOutboxRepo) MarkPublished(_ context.Context, _ uint64, _ string, _ time.Time) error {
+	return nil
+}
+func (f *fakeOutboxRepo) ReleaseWithRetry(_ context.Context, _ uint64, _ string, _ int, _ time.Time, _ string) error {
+	return nil
+}
+func (f *fakeOutboxRepo) DeleteOldPublished(_ context.Context, _ time.Time, _ int) (int64, error) {
+	return 0, nil
 }
 
 func (f *fakeRepo) Create(_ context.Context, job *QueryJob) error {
@@ -149,10 +180,11 @@ func (f *fakeExecutor) Execute(_ context.Context, query string) ([]string, [][]a
 
 // --- Service (API side) tests ---
 
+var defaultOutbox = &fakeOutboxRepo{}
+
 func TestService_Submit_Success(t *testing.T) {
 	repo := &fakeRepo{}
-	pub := &fakePublisher{}
-	svc := NewService(repo, pub, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	job, err := svc.Submit(context.Background(), 1, "  查询所有商品  ", 1)
 	if err != nil {
@@ -164,19 +196,14 @@ func TestService_Submit_Success(t *testing.T) {
 	if job.Status != string(StatusQueued) {
 		t.Errorf("expected queued, got %s", job.Status)
 	}
-	// Must have transitioned pending→queued before publishing.
-	if len(repo.transitions) == 0 || repo.transitions[0] != "pending->queued" {
-		t.Errorf("expected pending->queued transition, got %v", repo.transitions)
-	}
-	if len(pub.published) != 1 || pub.published[0] != repo.created.ID {
-		t.Errorf("expected publish of job_id=%d, got %v", repo.created.ID, pub.published)
+	if !repo.createAndEnqueueCalled {
+		t.Error("CreateAndEnqueue must be called on success")
 	}
 }
 
 func TestService_Submit_InvalidQuestion(t *testing.T) {
 	repo := &fakeRepo{}
-	pub := &fakePublisher{}
-	svc := NewService(repo, pub, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	for _, q := range []string{"", "   "} {
 		_, err := svc.Submit(context.Background(), 1, q, 1)
@@ -185,69 +212,57 @@ func TestService_Submit_InvalidQuestion(t *testing.T) {
 			t.Errorf("question %q: expected INVALID_QUESTION, got %v", q, err)
 		}
 	}
-	if repo.created != nil {
+	if repo.createAndEnqueueCalled {
 		t.Error("no job should be created on validation failure")
-	}
-	if len(pub.published) != 0 {
-		t.Error("must not publish on validation failure")
 	}
 }
 
 func TestService_Submit_CreateFailure(t *testing.T) {
-	repo := &fakeRepo{createErr: errors.New("db down")}
-	pub := &fakePublisher{}
-	svc := NewService(repo, pub, defaultDSChecker)
+	repo := &fakeRepo{createAndEnqueueErr: errors.New("db down")}
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
 		t.Errorf("expected INTERNAL_ERROR, got %v", err)
 	}
-	if len(pub.published) != 0 {
-		t.Error("must not publish when create fails")
-	}
 }
 
+// TestService_Submit_TransitionQueuedFailure checks that CreateAndEnqueue failure
+// (which internally does the transition) returns INTERNAL_ERROR.
 func TestService_Submit_TransitionQueuedFailure(t *testing.T) {
-	repo := &fakeRepo{transitionErr: errors.New("lock fail")}
-	pub := &fakePublisher{}
-	svc := NewService(repo, pub, defaultDSChecker)
+	repo := &fakeRepo{createAndEnqueueErr: errors.New("lock fail")}
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeInternal {
 		t.Errorf("expected INTERNAL_ERROR, got %v", err)
 	}
-	if len(pub.published) != 0 {
-		t.Error("must not publish when queued transition fails")
-	}
 }
 
-func TestService_Submit_PublishFailure(t *testing.T) {
+// TestService_Submit_RabbitMQUnavailable verifies Submit returns 202 even when
+// RabbitMQ is unavailable — publishing is now handled by the Dispatcher.
+func TestService_Submit_RabbitMQUnavailable(t *testing.T) {
 	repo := &fakeRepo{}
-	pub := &fakePublisher{publishErr: errors.New("broker unavailable")}
-	svc := NewService(repo, pub, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
-	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
-	var svcErr *ServiceError
-	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodePublishFailed {
-		t.Errorf("expected PUBLISH_FAILED, got %v", err)
+	// RabbitMQ is never involved in Submit in Phase 8; always returns queued job.
+	job, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
+	if err != nil {
+		t.Fatalf("Submit must succeed even without RabbitMQ: %v", err)
 	}
-	if !repo.setFailedCalled {
-		t.Error("job must be marked failed when publish fails")
+	if job.Status != string(StatusQueued) {
+		t.Errorf("expected queued status, got %s", job.Status)
 	}
-	if repo.setFailedCode != ErrCodePublishFailed {
-		t.Errorf("failed error_code: got %q, want %q", repo.setFailedCode, ErrCodePublishFailed)
-	}
-	// Error message must not mention broker internals.
-	if svcErr.Message != msgPublishFailed {
-		t.Errorf("error message must be safe: %q", svcErr.Message)
+	if !repo.createAndEnqueueCalled {
+		t.Error("CreateAndEnqueue must be called")
 	}
 }
 
 func TestService_Get_NotFound(t *testing.T) {
 	repo := &fakeRepo{findErr: ErrJobNotFound}
-	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	_, err := svc.Get(context.Background(), 1, 99)
 	if !errors.Is(err, ErrJobNotFound) {
@@ -258,7 +273,7 @@ func TestService_Get_NotFound(t *testing.T) {
 func TestService_Get_Success(t *testing.T) {
 	want := &QueryJob{ID: 7, Status: string(StatusSucceeded), UserID: sql.NullInt64{Int64: 7, Valid: true}}
 	repo := &fakeRepo{findResult: want}
-	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	got, err := svc.Get(context.Background(), 7, 7)
 	if err != nil {
@@ -899,14 +914,14 @@ func l0() *fakeLLM { return &fakeLLM{sql: "SELECT id FROM products"} }
 
 func TestService_Submit_SetsUserID(t *testing.T) {
 	repo := &fakeRepo{}
-	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	_, err := svc.Submit(context.Background(), 42, "查询所有商品", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if repo.created == nil {
-		t.Fatal("expected Create to be called")
+		t.Fatal("expected CreateAndEnqueue to be called")
 	}
 	if !repo.created.UserID.Valid || uint64(repo.created.UserID.Int64) != 42 {
 		t.Errorf("UserID: got %+v, want {Int64:42 Valid:true}", repo.created.UserID)
@@ -916,7 +931,7 @@ func TestService_Submit_SetsUserID(t *testing.T) {
 func TestService_Get_WrongOwner_NotFound(t *testing.T) {
 	job := &QueryJob{ID: 3, Status: string(StatusSucceeded), UserID: sql.NullInt64{Int64: 10, Valid: true}}
 	repo := &fakeRepo{findResult: job}
-	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	// callerID=99 != job.UserID=10 → must return ErrJobNotFound
 	_, err := svc.Get(context.Background(), 99, 3)
@@ -929,7 +944,7 @@ func TestService_Get_NullUserID_NotFound(t *testing.T) {
 	// Legacy row with NULL user_id must be inaccessible to any caller.
 	job := &QueryJob{ID: 3, Status: string(StatusSucceeded)}
 	repo := &fakeRepo{findResult: job}
-	svc := NewService(repo, &fakePublisher{}, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	_, err := svc.Get(context.Background(), 10, 3)
 	if !errors.Is(err, ErrJobNotFound) {
@@ -977,38 +992,30 @@ func TestResultService_GetResult_NullUserID_NoRedis(t *testing.T) {
 
 func TestService_Submit_MissingDataSource(t *testing.T) {
 	repo := &fakeRepo{}
-	pub := &fakePublisher{}
-	svc := NewService(repo, pub, defaultDSChecker)
+	svc := NewService(repo, defaultOutbox, defaultDSChecker)
 
 	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 0)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeMissingDataSource {
 		t.Errorf("expected MISSING_DATA_SOURCE, got %v", err)
 	}
-	if repo.created != nil {
+	if repo.createAndEnqueueCalled {
 		t.Error("no job should be created when data_source_id is missing")
-	}
-	if len(pub.published) != 0 {
-		t.Error("must not publish when data source is missing")
 	}
 }
 
 func TestService_Submit_DataSourceNotOwned(t *testing.T) {
 	repo := &fakeRepo{}
-	pub := &fakePublisher{}
 	dsCheck := &fakeDataSourceChecker{exists: false}
-	svc := NewService(repo, pub, dsCheck)
+	svc := NewService(repo, defaultOutbox, dsCheck)
 
 	_, err := svc.Submit(context.Background(), 1, "查询所有商品", 1)
 	var svcErr *ServiceError
 	if !errors.As(err, &svcErr) || svcErr.Code != ErrCodeDataSourceNotFound {
 		t.Errorf("expected DATA_SOURCE_NOT_FOUND, got %v", err)
 	}
-	if repo.created != nil {
+	if repo.createAndEnqueueCalled {
 		t.Error("no job should be created when data source does not belong to caller")
-	}
-	if len(pub.published) != 0 {
-		t.Error("must not publish when data source ownership check fails")
 	}
 }
 

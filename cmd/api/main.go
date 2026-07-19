@@ -25,6 +25,17 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/user"
 )
 
+// nullRabbitChecker satisfies handler.HealthDeps.Rabbit when no MQ connection
+// was established at startup. It always reports unhealthy so /readyz returns 503.
+type nullRabbitChecker struct{}
+
+func (nullRabbitChecker) IsHealthy() bool { return false }
+
+// rabbitChecker abstracts the RabbitMQ health check for /readyz.
+type rabbitChecker interface {
+	IsHealthy() bool
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
@@ -65,23 +76,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	mq, err := infra.NewRabbitMQ(cfg.RabbitMQURL)
-	if err != nil {
-		slog.Error("rabbitmq init failed", "err", err)
-		os.Exit(1)
-	}
-
-	// Publisher uses a dedicated channel, separate from the health-check channel.
-	pubCh, err := mq.NewChannel()
-	if err != nil {
-		slog.Error("rabbitmq: open publisher channel failed", "err", err)
-		os.Exit(1)
-	}
-
-	publisher, err := queryjob.NewRabbitMQPublisher(pubCh, cfg.MQConfirmTimeout)
-	if err != nil {
-		slog.Error("publisher init failed", "err", err)
-		os.Exit(1)
+	// RabbitMQ is not a hard startup dependency for the API. The Dispatcher
+	// reconnects in the background when the broker becomes available.
+	// /readyz reports rabbitmq=unreachable until connectivity is established.
+	var mq *infra.RabbitMQ
+	var rabbit rabbitChecker = nullRabbitChecker{}
+	if mqInst, mqErr := infra.NewRabbitMQ(cfg.RabbitMQURL); mqErr != nil {
+		slog.Warn("rabbitmq init failed; dispatcher will reconnect in background", "err", mqErr)
+	} else {
+		mq = mqInst
+		rabbit = mq
 	}
 
 	// --- crypto cipher ---
@@ -117,13 +121,26 @@ func main() {
 	authSvc := user.NewAuthService(userRepo, jwtMgr)
 	authHandler := user.NewAuthHandler(authSvc)
 
-	// --- query-job wiring ---
+	// --- query-job wiring (Phase 8: Outbox replaces direct publisher) ---
 	repo := queryjob.NewGORMRepository(db.GORM)
+	outboxRepo := queryjob.NewGORMOutboxRepository(db.GORM)
 	resultStore := queryresult.NewRedisStore(rdb)
-	// dsRepo also implements queryjob.DataSourceChecker via ExistsForUser.
-	queryService := queryjob.NewService(repo, publisher, dsRepo)
+	queryService := queryjob.NewService(repo, outboxRepo, dsRepo)
 	resultService := queryjob.NewResultService(repo, resultStore)
 	queryHandler := handler.NewQueryJobHandler(queryService, resultService)
+
+	// --- Outbox Dispatcher (runs in API background; owns its own MQ connection) ---
+	dispatcher := queryjob.NewDispatcher(outboxRepo, cfg.RabbitMQURL, queryjob.DispatcherConfig{
+		PollInterval:    cfg.OutboxPollInterval,
+		BatchSize:       cfg.OutboxBatchSize,
+		LeaseTTL:        cfg.OutboxLeaseTTL,
+		BaseBackoff:     cfg.OutboxBaseBackoff,
+		MaxBackoff:      cfg.OutboxMaxBackoff,
+		PublishedRetain: cfg.OutboxPublishedRetain,
+		CleanBatch:      cfg.OutboxCleanBatch,
+		ConfirmTimeout:  cfg.MQConfirmTimeout,
+	})
+	dispatcher.Start()
 
 	// --- routes ---
 	r := gin.New()
@@ -133,7 +150,7 @@ func main() {
 	r.GET("/readyz", handler.Readyz(handler.HealthDeps{
 		MySQL:  db,
 		Redis:  rdb,
-		Rabbit: mq,
+		Rabbit: rabbit,
 	}))
 
 	// Public auth routes — no Bearer middleware.
@@ -181,19 +198,23 @@ func main() {
 	<-quit
 	slog.Info("api: shutdown signal received")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("api: shutdown error", "err", err)
 	}
 
+	// Stop dispatcher: wait for in-flight publishes, then release unclaimed events.
+	dispatchCtx, dispatchCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dispatchCancel()
+	dispatcher.Stop(dispatchCtx)
+
 	// Close infrastructure in reverse-init order.
-	if err := publisher.Close(); err != nil {
-		slog.Error("publisher: close error", "err", err)
-	}
-	if err := mq.Close(); err != nil {
-		slog.Error("rabbitmq: close error", "err", err)
+	if mq != nil {
+		if err := mq.Close(); err != nil {
+			slog.Error("rabbitmq: close error", "err", err)
+		}
 	}
 	if err := rdb.Close(); err != nil {
 		slog.Error("redis: close error", "err", err)

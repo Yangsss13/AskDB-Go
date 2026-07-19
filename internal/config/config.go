@@ -92,6 +92,37 @@ type Config struct {
 	// RetryDelay is the fixed TTL applied to messages on the retry queue.
 	// Configured via RETRY_DELAY (default 30s).
 	RetryDelay time.Duration
+
+	// Phase 8: Transactional Outbox Dispatcher configuration.
+
+	// OutboxPollInterval is how often the Dispatcher wakes to claim and publish
+	// outbox events. Configured via OUTBOX_POLL_INTERVAL (default 2s).
+	OutboxPollInterval time.Duration
+
+	// OutboxBatchSize is the maximum number of outbox events claimed per cycle.
+	// Must be >= 1. Configured via OUTBOX_BATCH_SIZE (default 10).
+	OutboxBatchSize int
+
+	// OutboxLeaseTTL is how long a claimed event is held before another instance
+	// may take it over. Must be > OutboxPollInterval.
+	// Configured via OUTBOX_LEASE_TTL (default 30s).
+	OutboxLeaseTTL time.Duration
+
+	// OutboxBaseBackoff is the initial exponential-backoff delay on publish failure.
+	// Configured via OUTBOX_BASE_BACKOFF (default 5s).
+	OutboxBaseBackoff time.Duration
+
+	// OutboxMaxBackoff caps the exponential-backoff delay.
+	// Configured via OUTBOX_MAX_BACKOFF (default 10m).
+	OutboxMaxBackoff time.Duration
+
+	// OutboxPublishedRetain is how long published events are kept before cleanup.
+	// Configured via OUTBOX_PUBLISHED_RETAIN (default 24h).
+	OutboxPublishedRetain time.Duration
+
+	// OutboxCleanBatch is the maximum number of published events deleted per cycle.
+	// Must be >= 1. Configured via OUTBOX_CLEAN_BATCH (default 100).
+	OutboxCleanBatch int
 }
 
 // Load reads the .env file (if present) as a fallback, then reads environment
@@ -127,6 +158,14 @@ func Load() (*Config, error) {
 		MQConfirmTimeout:         getDurationEnv("MQ_CONFIRM_TIMEOUT", 5*time.Second),
 		RetryMaxAttempts:         getIntEnv("RETRY_MAX_ATTEMPTS", 3),
 		RetryDelay:               getDurationEnv("RETRY_DELAY", 30*time.Second),
+
+		OutboxPollInterval:    getDurationEnv("OUTBOX_POLL_INTERVAL", 2*time.Second),
+		OutboxBatchSize:       getIntEnv("OUTBOX_BATCH_SIZE", 10),
+		OutboxLeaseTTL:        getDurationEnv("OUTBOX_LEASE_TTL", 30*time.Second),
+		OutboxBaseBackoff:     getDurationEnv("OUTBOX_BASE_BACKOFF", 5*time.Second),
+		OutboxMaxBackoff:      getDurationEnv("OUTBOX_MAX_BACKOFF", 10*time.Minute),
+		OutboxPublishedRetain: getDurationEnv("OUTBOX_PUBLISHED_RETAIN", 24*time.Hour),
+		OutboxCleanBatch:      getIntEnv("OUTBOX_CLEAN_BATCH", 100),
 	}
 
 	// DATA_SOURCE_KEY is base64-encoded; decode and validate length here so
@@ -168,6 +207,27 @@ func (c *Config) validate() error {
 	}
 	if c.MaxResultBytes <= 0 {
 		return fmt.Errorf("config: MAX_RESULT_BYTES must be greater than zero, got %d", c.MaxResultBytes)
+	}
+	if c.OutboxPollInterval <= 0 {
+		return fmt.Errorf("config: OUTBOX_POLL_INTERVAL must be greater than zero, got %s", c.OutboxPollInterval)
+	}
+	if c.OutboxBatchSize <= 0 {
+		return fmt.Errorf("config: OUTBOX_BATCH_SIZE must be greater than zero, got %d", c.OutboxBatchSize)
+	}
+	if c.OutboxLeaseTTL <= 0 {
+		return fmt.Errorf("config: OUTBOX_LEASE_TTL must be greater than zero, got %s", c.OutboxLeaseTTL)
+	}
+	if c.OutboxBaseBackoff <= 0 {
+		return fmt.Errorf("config: OUTBOX_BASE_BACKOFF must be greater than zero, got %s", c.OutboxBaseBackoff)
+	}
+	if c.OutboxMaxBackoff <= 0 {
+		return fmt.Errorf("config: OUTBOX_MAX_BACKOFF must be greater than zero, got %s", c.OutboxMaxBackoff)
+	}
+	if c.OutboxPublishedRetain <= 0 {
+		return fmt.Errorf("config: OUTBOX_PUBLISHED_RETAIN must be greater than zero, got %s", c.OutboxPublishedRetain)
+	}
+	if c.OutboxCleanBatch <= 0 {
+		return fmt.Errorf("config: OUTBOX_CLEAN_BATCH must be greater than zero, got %d", c.OutboxCleanBatch)
 	}
 	return nil
 }

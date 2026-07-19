@@ -136,7 +136,7 @@ docs/adr/         — 技术选型记录（ADR）
 
 ---
 
-## 当前能力（阶段 7）
+## 当前能力（阶段 8）
 
 在阶段 6B 链路之上新增**RabbitMQ Retry、DLQ 与消费者幂等**；同时保留用户认证、数据源归属、SQL Guard 与 Redis 结果缓存能力。
 
@@ -144,7 +144,7 @@ docs/adr/         — 技术选型记录（ADR）
 
 1. 客户端注册并登录，获取 JWT（HS256），后续携带 `Authorization: Bearer <token>` 访问受保护接口
 2. API 校验 Bearer Token，从 `sub` 解析出用户 ID
-3. API 接收问题，创建归属当前用户的任务，发布消息到 RabbitMQ，立即返回 **HTTP 202**
+3. API 接收问题，在同一 MySQL 事务中创建 queued 任务并写入 Outbox，Dispatcher 异步发布，立即返回 **HTTP 202**
 4. Worker 消费消息，调用 Fake LLM 生成 SQL
 5. **SQL Guard** 通过 AST 解析验证并规范化 SQL（状态：`validating`）
 6. Guard 拒绝的 SQL 直接标记为 failed，不执行查询
@@ -161,12 +161,12 @@ docs/adr/         — 技术选型记录（ADR）
 
 - SQL 由 **Fake LLM** 返回硬编码 SELECT，**未接入真实大模型**。
 - 结果缓存到期（默认 15 分钟）后不支持重建，需重新提交任务。
-- API 初始发布以及 Worker 的 Retry/DLQ 发布均使用 Publisher Confirm、`mandatory=true` 和 Basic.Return 检查；只有发布确认及必要 MySQL 状态写入成功后才 ACK，否则 NACK/requeue。
+- Outbox Dispatcher 以及 Worker 的 Retry/DLQ 发布均使用 Publisher Confirm、`mandatory=true` 和 Basic.Return 检查；只有发布确认及必要 MySQL 状态写入成功后才 ACK，否则重试或 NACK/requeue。
 - Retry 使用 `askdb.retry` / `askdb.query.retry` 固定 TTL 队列，经 DLX 回流 `askdb.events` 主队列；达到 `RETRY_MAX_ATTEMPTS` 后发布到独立 `askdb.dlq` / `askdb.query.dlq` 并将任务标记 failed。
 - 消息使用 `x-attempt` Header 记录重试次数，任务使用 `retrying`、`attempt_count`、`next_retry_at` 表示重试状态。
 - `processed_messages` 以 `message_id` 及 `message_type + job_id` 业务键防重；处理 Lease 续租失败会 NACK，Lease 过期可由其他 Worker 接管。
 - RabbitMQ Body 只含消息元数据和 `job_id`，不含问题、SQL、DSN、密码、Token 或密钥。
-- 当前不保证 Exactly-Once；消息和 DLQ 记录仍可能重复。Transactional Outbox 与 Exactly-Once 留到阶段 8。
+- Transactional Outbox 保证数据库提交与待发布事件不分离，但发布确认后标记前崩溃仍可能重复；整体是 At-Least-Once，不实现 Exactly Once。
 - SQL Guard 是纵深防御，不替代 askdb_reader 的数据库只读权限。
 - **认证仅提供注册、登录与单一 access token（HS256）**：不支持刷新 Token、登出/吊销、RBAC 角色权限、OAuth 或第三方登录。
 - Token 一经签发在有效期内始终有效，无法主动失效；`JWT_ACCESS_TTL` 默认 24h。
@@ -305,6 +305,24 @@ succeeded 轮询响应（含缓存到期时间）：
 
 - [阶段规划](docs/PLAN.md)
 - [架构说明](docs/ARCHITECTURE.md)
+
+## Phase 8: Transactional Outbox
+
+The API transaction creates `query_jobs`, performs `pending -> queued`, and
+inserts one `query.execution.requested` row in `outbox_events`. The transaction
+rolls back as a unit. The API does not publish the initial RabbitMQ message;
+the in-process Dispatcher claims rows with `SKIP LOCKED`, `lease_token`, and
+lease expiry recovery, then publishes asynchronously. RabbitMQ unavailability
+therefore does not prevent a committed submission from returning HTTP 202;
+`/readyz` reports 503 until RabbitMQ is healthy.
+
+Outbox retries use `next_retry_at` and capped exponential backoff, independently
+of the Worker Retry/DLQ queues. `message_id`, `occurred_at`, and the JSON payload
+(`job_id` only) remain stable across republishing. Existing mandatory publish,
+Basic.Return, and Publisher Confirm checks run before marking an event
+`published`. A crash after Confirm and before that mark may duplicate delivery;
+Phase 7 consumer idempotency handles it. This is At-Least-Once delivery, not
+Exactly Once. Real LLM and frontend work remain out of scope.
 
 ---
 

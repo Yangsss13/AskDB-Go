@@ -10,6 +10,43 @@ import (
 	"gorm.io/gorm"
 )
 
+// CreateAndEnqueue atomically creates a pending job, transitions it to queued,
+// and inserts an OutboxEvent, all in a single MySQL transaction.
+// It populates job.ID after the insert. On any failure the whole transaction
+// rolls back so there is never a queued job without a corresponding outbox event.
+func (r *GORMRepository) CreateAndEnqueue(ctx context.Context, job *QueryJob, event *OutboxEvent) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(job).Error; err != nil {
+			return fmt.Errorf("queryjob: create: %w", err)
+		}
+		// pending → queued
+		res := tx.Model(&QueryJob{}).
+			Where("id = ? AND status = ?", job.ID, string(StatusPending)).
+			Updates(map[string]any{
+				"status":     string(StatusQueued),
+				"updated_at": time.Now(),
+			})
+		if res.Error != nil {
+			return fmt.Errorf("queryjob: transition pending→queued: %w", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return fmt.Errorf("queryjob: transition pending→queued id=%d: %w", job.ID, ErrStatusConflict)
+		}
+		job.Status = string(StatusQueued)
+
+		event.JobID = job.ID
+		payload, err := marshalOutboxPayload(job.ID)
+		if err != nil {
+			return fmt.Errorf("queryjob: marshal outbox payload: %w", err)
+		}
+		event.Payload = payload
+		if err := tx.Create(event).Error; err != nil {
+			return fmt.Errorf("queryjob: create outbox event: %w", err)
+		}
+		return nil
+	})
+}
+
 // ErrStatusConflict is returned when a conditional status update finds no
 // matching row — either the job's current status differed from the expected
 // "from" state, or the job no longer exists.
