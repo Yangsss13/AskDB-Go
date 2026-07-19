@@ -55,7 +55,7 @@
 
 ---
 
-### 阶段 4：Redis 结果缓存（当前）
+### 阶段 4：Redis 结果缓存（已完成）
 
 **目标**：Worker 将完整查询结果写入 Redis，新增结果获取接口。
 
@@ -63,7 +63,7 @@
 - [x] `internal/queryresult`：`CachedQueryResult` 结构体、`RedisStore`（Set / Get）、哨兵错误（ErrResultNotFound / ErrResultCorrupted / ErrResultStoreUnavailable）
 - [x] JSON 反序列化使用 `UseNumber()`，保证 int64 往返不升格为 float64
 - [x] Worker 写入顺序：查询成功 → 构造 CachedQueryResult → Set Redis（带 TTL）→ 成功后 SetSucceeded（含 result_expires_at）→ ACK
-- [x] Redis 写入失败：SetFailed（RESULT_CACHE_FAILED）→ ACK；SetFailed 也失败：不 ACK
+- [x] Redis 写入失败（阶段 4 基线）：曾使用 SetFailed（RESULT_CACHE_FAILED）→ ACK；该路径已由阶段 7 的 Retry/DLQ 流程覆盖
 - [x] `GET /api/v1/query-jobs/:id/result`：先查 MySQL 状态，再读 Redis；区分 410（到期）/ 503（提前丢失）/ 503（不可用）
 - [x] `GET /api/v1/query-jobs/:id` succeeded 时新增 `result_expires_at`，不含完整 rows
 - [x] `QUERY_RESULT_TTL` 环境变量配置缓存 TTL，默认 15m，必须 > 0
@@ -80,7 +80,7 @@
 
 ---
 
-### 阶段 5：SQL Guard 与查询资源限制（当前）
+### 阶段 5：SQL Guard 与查询资源限制（已完成）
 
 **目标**：在 Worker 查询链路中加入 SQL Guard，所有 LLM 生成的 SQL 必须经过 AST 验证和规范化后才能执行。
 
@@ -108,7 +108,7 @@
 
 ---
 
-### 阶段 6A：用户认证、JWT 与查询任务归属（当前）
+### 阶段 6A：用户认证、JWT 与查询任务归属（已完成）
 
 **目标**：引入用户系统，查询任务按用户隔离。注册/登录签发 JWT，受保护接口用 Bearer 中间件鉴权。
 
@@ -147,3 +147,43 @@
 - `RegisterDialContext` 条目随动态连接增长，不清理（连接数有界，内存可控）
 - `AllowedTables` 白名单固定，暂不支持用户自定义配置
 - 无密钥轮换 UI；轮换需手动重加密并更换 `DATA_SOURCE_KEY`
+
+---
+
+### 阶段 7：RabbitMQ Retry、DLQ 与消费者幂等（已完成）
+
+**目标**：在不修改现有主队列声明参数的前提下，实现 Retry Queue（固定 TTL + DLX 回流）、Dead-Letter Queue、Publisher Confirm（mandatory=true）和基于 `processed_messages` 的消费者幂等协议。
+
+- [x] Migration 000007：`query_jobs` 新增 `attempt_count`（TINYINT）、`next_retry_at`（DATETIME(3)）
+- [x] Migration 000008：创建 `processed_messages` 表（PK: message_id；唯一约束: message_type+job_id；状态机: processing/retry_scheduled/completed；lease_token + lease_expires_at）
+- [x] 新增 `retrying` 状态；合法迁移路径：`generating/validating/executing → retrying → generating`
+- [x] 消息 Body 不变；`x-attempt`（int32）放 AMQP Header，严格校验类型/负数/溢出
+- [x] API 初始发布和 Worker Retry/DLQ 发布使用独立 confirm-mode channel；`mandatory=true`；同时检查 Basic.Return 和 DeferredConfirmation；互斥序列化；超时 `MQ_CONFIRM_TIMEOUT`
+- [x] Retry Queue：`askdb.query.retry`（durable, x-message-ttl, x-dead-letter-exchange → 主 Exchange/Route）；不改主队列声明
+- [x] DLQ：独立 `askdb.dlq` / `askdb.query.dlq`（durable, 无 TTL/DLX）；达到最大重试次数后 Confirm DLQ，再 SetFailed
+- [x] `GORMProcessedMessageRepository`：Claim（事务 + `clause.Locking{FOR UPDATE}`）、Renew、MarkRetryScheduled、MarkCompleted，均用 lease_token CAS
+- [x] WorkerService 接受 `ProcessRequest`（含 MessageID、Attempt）；`isRetryableError` / `isDeterministicFailure` 基于 `errors.Is/As`
+- [x] `scheduleRetryOrFail`：attempt < maxRetries → Retry Confirm → SetRetrying → ErrRetryScheduled；否则 → DLQ Confirm → SetFailed → ErrDLQScheduled
+- [x] Consumer：Claim → Lease 续租（固定 `leaseTTL=30s`，每 `leaseTTL/3≈10s`）→ Process → MarkRetryScheduled/MarkCompleted → ACK；Lease 丢失 → NACK requeue；过期 Lease 可 CAS 接管
+- [x] malformed/未知版本/job_id=0/无效 x-attempt/ErrJobNotFound/ClaimConflict → DLQ → ACK；DLQ confirm 失败 → NACK requeue
+- [x] 配置：`MQ_CONFIRM_TIMEOUT`（默认 5s）、`RETRY_MAX_ATTEMPTS`（默认 3）、`RETRY_DELAY`（默认 30s）
+- [x] ACK 前置条件：Retry/DLQ 发布 Confirm 与必要的 `query_jobs`、`processed_messages` 状态写入均成功；否则 NACK/requeue
+- [x] 消息 Body 仍只含消息元数据和 `job_id`，不含问题、SQL、DSN、密码、Token 或密钥
+- [x] `go test -race ./...` 通过；单元测试覆盖 Confirm/Return 失败、重复 message_id、ClaimConflict、Lease 续期/接管/失去、stale/future attempt、最大重试、malformed/未知版本、终态重投不执行、两 Worker 并发 Claim
+
+**可靠性边界（At-Least-Once）**：
+- Retry/DLQ Confirm 到 MySQL 写入之间的崩溃窗口允许重复消息；幂等层处理。
+- DLQ 可能重复（DLQ Confirm 成功但 SetFailed 失败）；文档明确。
+- **Transactional Outbox / Exactly-Once 留到阶段 8。**
+
+**本阶段不实现**：Transactional Outbox、Exactly Once、真实 LLM、RBAC、前端、密钥轮换 UI
+
+---
+
+### 阶段 8：Transactional Outbox 与 Exactly-Once（下一阶段）
+
+**目标**：围绕数据库事务与消息发布一致性，设计并实现 Transactional Outbox，并在明确边界后推进 Exactly-Once 语义。
+
+- [ ] Transactional Outbox：将任务状态变更与待发布事件写入同一数据库事务
+- [ ] Outbox Relay：可靠发布、重试、确认与投递状态管理
+- [ ] 在 At-Least-Once 基础上评估并实现可验证的 Exactly-Once 处理边界

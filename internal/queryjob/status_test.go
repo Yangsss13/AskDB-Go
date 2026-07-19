@@ -13,11 +13,16 @@ func TestStatus_CanTransition(t *testing.T) {
 		{StatusQueued, StatusGenerating, true},
 		{StatusQueued, StatusFailed, true},
 		{StatusGenerating, StatusValidating, true},
+		{StatusGenerating, StatusRetrying, true},
 		{StatusGenerating, StatusFailed, true},
 		{StatusValidating, StatusExecuting, true},
+		{StatusValidating, StatusRetrying, true},
 		{StatusValidating, StatusFailed, true},
 		{StatusExecuting, StatusSucceeded, true},
+		{StatusExecuting, StatusRetrying, true},
 		{StatusExecuting, StatusFailed, true},
+		{StatusRetrying, StatusGenerating, true},
+		{StatusRetrying, StatusFailed, true},
 
 		// Illegal / skipping transitions.
 		{StatusPending, StatusGenerating, false},
@@ -25,24 +30,32 @@ func TestStatus_CanTransition(t *testing.T) {
 		{StatusPending, StatusSucceeded, false},
 		{StatusQueued, StatusExecuting, false},
 		{StatusQueued, StatusSucceeded, false},
-		{StatusGenerating, StatusExecuting, false}, // must go through validating
+		{StatusGenerating, StatusExecuting, false},
 		{StatusGenerating, StatusSucceeded, false},
 		{StatusGenerating, StatusQueued, false},
 		{StatusValidating, StatusQueued, false},
 		{StatusValidating, StatusGenerating, false},
 		{StatusValidating, StatusSucceeded, false},
 
-		// Terminal states can never move back to any processing state.
+		// Terminal states can never move back.
 		{StatusSucceeded, StatusQueued, false},
 		{StatusSucceeded, StatusGenerating, false},
 		{StatusSucceeded, StatusExecuting, false},
 		{StatusSucceeded, StatusFailed, false},
+		{StatusSucceeded, StatusRetrying, false},
 		{StatusSucceeded, StatusPending, false},
 		{StatusFailed, StatusPending, false},
 		{StatusFailed, StatusQueued, false},
 		{StatusFailed, StatusGenerating, false},
 		{StatusFailed, StatusExecuting, false},
 		{StatusFailed, StatusSucceeded, false},
+		{StatusFailed, StatusRetrying, false},
+
+		// retrying cannot skip ahead.
+		{StatusRetrying, StatusValidating, false},
+		{StatusRetrying, StatusExecuting, false},
+		{StatusRetrying, StatusSucceeded, false},
+		{StatusRetrying, StatusQueued, false},
 	}
 
 	for _, c := range cases {
@@ -54,7 +67,7 @@ func TestStatus_CanTransition(t *testing.T) {
 
 func TestStatus_IsTerminal(t *testing.T) {
 	terminal := []Status{StatusSucceeded, StatusFailed}
-	nonTerminal := []Status{StatusPending, StatusQueued, StatusGenerating, StatusValidating, StatusExecuting}
+	nonTerminal := []Status{StatusPending, StatusQueued, StatusGenerating, StatusValidating, StatusExecuting, StatusRetrying}
 
 	for _, s := range terminal {
 		if !s.IsTerminal() {

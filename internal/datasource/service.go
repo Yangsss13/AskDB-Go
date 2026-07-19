@@ -370,6 +370,7 @@ func (s *Service) buildDB(ds *DataSource, password string, target *netguard.Vali
 		Addr:                 net.JoinHostPort(target.Host, fmt.Sprintf("%d", ds.Port)),
 		DBName:               ds.DatabaseName,
 		ParseTime:            true,
+		Loc:                  time.UTC, // prevent nil-location panic on datetime columns
 		AllowNativePasswords: true,
 		Timeout:              time.Duration(ds.ConnectTimeoutSec) * time.Second,
 		TLS:                  tlsCfg, // per-config, not global registry

@@ -54,6 +54,12 @@ Copy-Item .env.example .env
 > 阶段 6A 新增 JWT 配置：`JWT_SECRET`（**仅 API 必填**，至少 32 字节）、`JWT_ISSUER`（可选，默认 `askdb-api`）、
 > `JWT_ACCESS_TTL`（可选，默认 24h）。Worker **不需要也不接触** `JWT_SECRET`，未配置时仍可正常启动。
 > 示例中的 secret 仅为本地开发占位，生产环境必须注入独立的高强度随机值。
+>
+> 阶段 7 新增三个可选变量（均有默认值）：`MQ_CONFIRM_TIMEOUT`（默认 5s，Publisher Confirm 超时）、
+> `RETRY_MAX_ATTEMPTS`（默认 3，可重试次数上限；0 = 直接 DLQ）、
+> `RETRY_DELAY`（默认 30s，Retry Queue TTL）。
+> Consumer 幂等 Lease 当前由代码固定为 30s，并每约 10s 续租；没有对应的环境变量。
+> 本阶段是 **At-Least-Once**：消息和 DLQ 记录可能重复，通过 `processed_messages` 幂等协议降低重复执行风险；Exactly-Once 留到阶段 8。
 
 ### 3. 执行数据库迁移
 
@@ -130,9 +136,9 @@ docs/adr/         — 技术选型记录（ADR）
 
 ---
 
-## 当前能力（阶段 6A）
+## 当前能力（阶段 7）
 
-在阶段 5 链路之上新增**用户认证与查询任务归属**：注册、登录、JWT Bearer 鉴权，查询任务按用户隔离。
+在阶段 6B 链路之上新增**RabbitMQ Retry、DLQ 与消费者幂等**；同时保留用户认证、数据源归属、SQL Guard 与 Redis 结果缓存能力。
 
 打通 **RabbitMQ 异步 + SQL Guard + Redis 结果缓存**完整链路：
 
@@ -155,8 +161,12 @@ docs/adr/         — 技术选型记录（ADR）
 
 - SQL 由 **Fake LLM** 返回硬编码 SELECT，**未接入真实大模型**。
 - 结果缓存到期（默认 15 分钟）后不支持重建，需重新提交任务。
-- 发布消息不使用 Publisher Confirm，存在已知双写风险（见架构说明）。
-- 不保证 Exactly Once 消费。
+- API 初始发布以及 Worker 的 Retry/DLQ 发布均使用 Publisher Confirm、`mandatory=true` 和 Basic.Return 检查；只有发布确认及必要 MySQL 状态写入成功后才 ACK，否则 NACK/requeue。
+- Retry 使用 `askdb.retry` / `askdb.query.retry` 固定 TTL 队列，经 DLX 回流 `askdb.events` 主队列；达到 `RETRY_MAX_ATTEMPTS` 后发布到独立 `askdb.dlq` / `askdb.query.dlq` 并将任务标记 failed。
+- 消息使用 `x-attempt` Header 记录重试次数，任务使用 `retrying`、`attempt_count`、`next_retry_at` 表示重试状态。
+- `processed_messages` 以 `message_id` 及 `message_type + job_id` 业务键防重；处理 Lease 续租失败会 NACK，Lease 过期可由其他 Worker 接管。
+- RabbitMQ Body 只含消息元数据和 `job_id`，不含问题、SQL、DSN、密码、Token 或密钥。
+- 当前不保证 Exactly-Once；消息和 DLQ 记录仍可能重复。Transactional Outbox 与 Exactly-Once 留到阶段 8。
 - SQL Guard 是纵深防御，不替代 askdb_reader 的数据库只读权限。
 - **认证仅提供注册、登录与单一 access token（HS256）**：不支持刷新 Token、登出/吊销、RBAC 角色权限、OAuth 或第三方登录。
 - Token 一经签发在有效期内始终有效，无法主动失效；`JWT_ACCESS_TTL` 默认 24h。

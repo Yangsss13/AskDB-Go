@@ -32,6 +32,9 @@ const (
 	// Phase 6B: data-source error codes used by Service.Submit.
 	ErrCodeMissingDataSource  = "MISSING_DATA_SOURCE"
 	ErrCodeDataSourceNotFound = "DATA_SOURCE_NOT_FOUND"
+
+	// Phase 7: retry / DLQ error codes.
+	ErrCodeMaxRetriesExceeded = "MAX_RETRIES_EXCEEDED"
 )
 
 // Safe, client-facing messages paired with the codes above.
@@ -43,10 +46,23 @@ const (
 	msgResultCacheFailed   = "failed to cache query result"
 	msgSQLValidationFailed = "generated query failed validation"
 	msgResultTooLarge      = "query result is too large"
+	msgMaxRetriesExceeded  = "query job exceeded maximum retry attempts"
 )
 
 // ErrJobNotFound is returned by the repository when no job matches the given ID.
 var ErrJobNotFound = errors.New("queryjob: not found")
+
+// Phase 7 sentinel errors returned by WorkerService.Process to the Consumer.
+// The Consumer maps these to ACK/NACK decisions without inspecting error text.
+var (
+	// ErrRetryScheduled means the retry message was published and the DB was
+	// updated; the Consumer should mark PM as retry_scheduled and ACK.
+	ErrRetryScheduled = errors.New("queryjob: retry scheduled")
+
+	// ErrDLQScheduled means the DLQ message was published and the terminal
+	// failed state was persisted; the Consumer should mark PM as completed and ACK.
+	ErrDLQScheduled = errors.New("queryjob: dlq scheduled")
+)
 
 // maxQuestionLen bounds the accepted question length (also enforced by the
 // query_jobs.question column width).

@@ -18,25 +18,22 @@ type Repository interface {
 	// TransitionStatus conditionally updates status from `from` to `to`.
 	// Returns ErrStatusConflict when no rows were affected.
 	TransitionStatus(ctx context.Context, id uint64, from, to Status) error
-	// SetSucceeded atomically writes the success terminal state.
-	// resultExpiresAt is the Redis cache expiry time; pass nil if no cache was written.
+	// SetRetrying transitions the job to retrying and records the attempt count.
 	// Returns ErrStatusConflict when no rows were affected.
+	SetRetrying(ctx context.Context, id uint64, from Status, attemptCount uint8, nextRetryAt time.Time) error
+	// SetSucceeded atomically writes the success terminal state.
 	SetSucceeded(ctx context.Context, id uint64, from Status, generatedSQL string, rowCount, durationMs int64, finishedAt time.Time, resultExpiresAt *time.Time) error
 	// SetFailed atomically writes the failure terminal state.
-	// Returns ErrStatusConflict when no rows were affected.
 	SetFailed(ctx context.Context, id uint64, from Status, errorCode, errorMessage string, finishedAt time.Time) error
 }
 
 // DataSourceChecker verifies data-source ownership. Declared on the consuming
 // side to keep the queryjob package free of datasource imports.
-// ExistsForUser returns true when a non-deleted source with dataSourceID is
-// owned by userID. Returns false for missing, cross-user, or soft-deleted rows.
 type DataSourceChecker interface {
 	ExistsForUser(ctx context.Context, dataSourceID, userID uint64) (bool, error)
 }
 
-// LLMClient turns a natural-language question into SQL. Implementations must
-// return llm.ErrUnsupportedQuestion for questions they do not recognize.
+// LLMClient turns a natural-language question into SQL.
 type LLMClient interface {
 	GenerateSQL(ctx context.Context, question string) (string, error)
 }
@@ -47,14 +44,37 @@ type QueryExecutor interface {
 }
 
 // ResultReader is the interface used by ResultService to read cached results.
-// Declared on the consuming side; queryresult.RedisStore implements it.
 type ResultReader interface {
 	Get(ctx context.Context, jobID uint64) (*queryresult.CachedQueryResult, error)
 }
 
+// ProcessRequest carries the context a consumer needs to process a delivery.
+// It contains only the minimal routing information; sensitive fields must never
+// appear here (no question, SQL, DSN, credentials, or tokens).
+type ProcessRequest struct {
+	JobID     uint64
+	MessageID string
+	Attempt   int
+}
+
+// ProcessService is the interface the Consumer uses to process a queued job.
+// Declared here so the Consumer can be tested without a real WorkerService.
+//
+// Return semantics (Consumer maps these to ACK/NACK):
+//   - nil              → terminal state persisted; Consumer marks PM completed, ACKs.
+//   - ErrRetryScheduled → retry published, DB set to retrying; Consumer marks PM
+//     retry_scheduled, ACKs.
+//   - ErrDLQScheduled  → DLQ published, SetFailed done; Consumer marks PM
+//     completed, ACKs.
+//   - ErrJobNotFound   → Consumer publishes to DLQ, marks PM completed, ACKs
+//     (or NACKs if DLQ publish fails).
+//   - any other error  → fatal; Consumer NACKs (channel close / requeue).
+type ProcessService interface {
+	Process(ctx context.Context, req ProcessRequest) error
+}
+
 // Service handles the API side of the query job lifecycle: validate the
 // question, create the job, update it to queued, and publish a message.
-// The worker side is handled by WorkerService.
 type Service struct {
 	repo    Repository
 	pub     Publisher
@@ -69,13 +89,6 @@ func NewService(repo Repository, pub Publisher, dsCheck DataSourceChecker) *Serv
 
 // Submit validates the question and dataSourceID, creates a pending job owned
 // by userID, advances it to queued, and publishes a message.
-//
-// Order of operations:
-//  1. Validate question → 400
-//  2. Verify dataSourceID ownership → 400 (missing) or 404 (wrong user/deleted)
-//  3. Create job (pending) → 500
-//  4. TransitionStatus pending→queued → 500
-//  5. Publish → on fail: SetFailed, return 503
 func (s *Service) Submit(ctx context.Context, userID uint64, question string, dataSourceID uint64) (*QueryJob, error) {
 	trimmed := strings.TrimSpace(question)
 	if trimmed == "" || len([]rune(trimmed)) > maxQuestionLen {
@@ -85,7 +98,6 @@ func (s *Service) Submit(ctx context.Context, userID uint64, question string, da
 		return nil, newServiceError(ErrCodeMissingDataSource, "data_source_id is required")
 	}
 
-	// Verify the caller owns the data source (prevents IDOR on submit).
 	exists, err := s.dsCheck.ExistsForUser(ctx, dataSourceID, userID)
 	if err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
@@ -107,7 +119,6 @@ func (s *Service) Submit(ctx context.Context, userID uint64, question string, da
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
 
-	// Atomically advance to queued before publishing.
 	if err := s.repo.TransitionStatus(ctx, job.ID, StatusPending, StatusQueued); err != nil {
 		return nil, newServiceError(ErrCodeInternal, msgInternal)
 	}
@@ -123,8 +134,6 @@ func (s *Service) Submit(ctx context.Context, userID uint64, question string, da
 }
 
 // Get returns the persisted job by ID for the given caller.
-// Returns ErrJobNotFound when the job is absent or belongs to a different user
-// (including NULL legacy rows), preventing IDOR leakage.
 func (s *Service) Get(ctx context.Context, callerID uint64, id uint64) (*QueryJob, error) {
 	job, err := s.repo.FindByID(ctx, id)
 	if err != nil {
@@ -136,8 +145,7 @@ func (s *Service) Get(ctx context.Context, callerID uint64, id uint64) (*QueryJo
 	return job, nil
 }
 
-// ResultService retrieves cached query results. It always checks MySQL first
-// to ensure Redis is never used as the source of truth for job status.
+// ResultService retrieves cached query results.
 type ResultService struct {
 	repo  Repository
 	store ResultReader
@@ -150,14 +158,11 @@ func NewResultService(repo Repository, store ResultReader) *ResultService {
 }
 
 // GetResult fetches the cached query result for a succeeded job owned by callerID.
-// Ownership is checked against MySQL before any Redis access is attempted.
 func (s *ResultService) GetResult(ctx context.Context, callerID uint64, jobID uint64) (*queryresult.CachedQueryResult, error) {
 	job, err := s.repo.FindByID(ctx, jobID)
 	if err != nil {
-		return nil, err // ErrJobNotFound propagates to handler
+		return nil, err
 	}
-
-	// Ownership check: NULL user_id (legacy rows) and mismatched owner both return 404.
 	if !ownsJob(job, callerID) {
 		return nil, ErrJobNotFound
 	}
@@ -167,16 +172,10 @@ func (s *ResultService) GetResult(ctx context.Context, callerID uint64, jobID ui
 	if status == StatusFailed {
 		return nil, newServiceError(ErrCodeQueryJobFailed, "query job failed")
 	}
-
 	if !status.IsTerminal() {
-		// pending, queued, generating, executing
 		return nil, newServiceError(ErrCodeResultNotReady, "result is not ready yet")
 	}
 
-	// status == succeeded from here.
-
-	// result_expires_at NULL means this job succeeded before caching was
-	// introduced, or the cache write failed.
 	if !job.ResultExpiresAt.Valid {
 		return nil, newServiceError(ErrCodeResultUnavailable, "result is not available")
 	}
@@ -188,8 +187,6 @@ func (s *ResultService) GetResult(ctx context.Context, callerID uint64, jobID ui
 	return result, nil
 }
 
-// mapStoreError translates queryresult sentinel errors into ServiceErrors,
-// using the job's result_expires_at to distinguish expiry from loss.
 func (s *ResultService) mapStoreError(err error, job *QueryJob) *ServiceError {
 	switch {
 	case errors.Is(err, queryresult.ErrResultNotFound):
@@ -204,8 +201,6 @@ func (s *ResultService) mapStoreError(err error, job *QueryJob) *ServiceError {
 	}
 }
 
-// ownsJob reports whether callerID is the owner of job.
-// Returns false for legacy rows (NULL user_id) and mismatched owners.
 func ownsJob(job *QueryJob, callerID uint64) bool {
 	return job.UserID.Valid && uint64(job.UserID.Int64) == callerID
 }

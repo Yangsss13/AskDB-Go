@@ -3,6 +3,7 @@ package queryjob
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -11,65 +12,49 @@ import (
 	"github.com/Yangsss13/askdb-go/internal/sqlguard"
 )
 
-// ProcessService is the interface the Consumer uses to process a queued job.
-// Declared here so the Consumer can be tested without a real WorkerService.
-type ProcessService interface {
-	Process(ctx context.Context, jobID uint64) error
-}
-
 // ResultWriter is the interface WorkerService uses to cache query results.
-// Declared on the consuming side; queryresult.RedisStore implements it.
-// SetRaw writes an already-serialized payload so the worker can serialize once,
-// enforce the size limit on the exact bytes, and reuse them for the write.
 type ResultWriter interface {
 	SetRaw(ctx context.Context, jobID uint64, payload []byte, ttl time.Duration) error
 }
 
-// SQLGuard validates and normalizes SQL before execution. Declared on the
-// consuming side; sqlguard.Guard implements it. Errors that wrap
-// sqlguard.ErrRejected are deterministic rejections (business failures); any
-// other error (e.g. ctx cancellation) is a runtime error.
+// SQLGuard validates and normalizes SQL before execution.
 type SQLGuard interface {
 	Validate(ctx context.Context, input sqlguard.ValidateInput) (sqlguard.ValidateResult, error)
 }
 
 // DataSourceOpener opens a single-use QueryExecutor for a given data source.
-// The caller must call the returned closer when done to release resources.
-// Returns the database name (for Guard AllowedDatabase) alongside the executor.
 type DataSourceOpener interface {
 	OpenForJob(ctx context.Context, dataSourceID uint64) (dbName string, exec QueryExecutor, closer func(), err error)
 }
 
 // GuardPolicy is the fixed validation policy applied to every generated query.
 type GuardPolicy struct {
-	// AllowedTables is the whitelist of tables that queries may access.
-	// Must never be nil; use a non-empty slice to enforce table restrictions.
 	AllowedTables []string
 	MaxRows       int
 }
 
-// WorkerService executes a query job end-to-end: it reads the job from MySQL,
+// WorkerService executes a query job end-to-end: reads the job from MySQL,
 // calls the Fake LLM, runs the query, caches the result in Redis, and persists
-// the terminal state in MySQL. It is called by the Consumer after a message is
-// received from RabbitMQ.
+// the terminal state. On retryable errors it schedules a retry via RabbitMQ.
 type WorkerService struct {
 	repo            Repository
 	llm             LLMClient
 	guard           SQLGuard
 	policy          GuardPolicy
-	exec            QueryExecutor    // static reader DB executor (legacy / nil-DataSourceID path)
-	staticAllowedDB string           // AllowedDatabase for the static path
-	dsOpener        DataSourceOpener // nil when dynamic data sources are not wired
+	exec            QueryExecutor
+	staticAllowedDB string
+	dsOpener        DataSourceOpener
 	store           ResultWriter
+	retryPub        RetryPublisher
 	queryTimeout    time.Duration
 	resultTTL       time.Duration
 	maxResultBytes  int64
+	maxRetries      int
+	retryDelay      time.Duration
 	now             func() time.Time
 }
 
 // NewWorkerService wires the worker-side dependencies.
-// staticAllowedDB is the AllowedDatabase value used when a job has no DataSourceID
-// (legacy path). dsOpener may be nil when dynamic data sources are not yet wired.
 func NewWorkerService(
 	repo Repository,
 	llmClient LLMClient,
@@ -77,11 +62,14 @@ func NewWorkerService(
 	policy GuardPolicy,
 	exec QueryExecutor,
 	store ResultWriter,
+	retryPub RetryPublisher,
 	queryTimeout time.Duration,
 	resultTTL time.Duration,
 	maxResultBytes int64,
 	staticAllowedDB string,
 	dsOpener DataSourceOpener,
+	maxRetries int,
+	retryDelay time.Duration,
 ) *WorkerService {
 	return &WorkerService{
 		repo:            repo,
@@ -92,22 +80,26 @@ func NewWorkerService(
 		staticAllowedDB: staticAllowedDB,
 		dsOpener:        dsOpener,
 		store:           store,
+		retryPub:        retryPub,
 		queryTimeout:    queryTimeout,
 		resultTTL:       resultTTL,
 		maxResultBytes:  maxResultBytes,
+		maxRetries:      maxRetries,
+		retryDelay:      retryDelay,
 		now:             time.Now,
 	}
 }
 
-// Process executes the full query workflow for the given job ID.
+// Process executes the full query workflow for the given request.
 //
-// Return semantics (the Consumer maps these to ACK/NACK/fatal):
-//   - nil            → job reached a terminal state and was persisted; ACK.
-//   - ErrJobNotFound → job does not exist in MySQL; NACK no-requeue.
-//   - ErrStatusConflict → unexpected status mismatch; treat as fatal (stop consumer).
-//   - any other error → MySQL write failure; treat as fatal (stop consumer, do NOT ACK).
-func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
-	job, err := s.repo.FindByID(ctx, jobID)
+// Return semantics (the Consumer maps these to ACK/NACK):
+//   - nil              → terminal state persisted; ACK.
+//   - ErrRetryScheduled → retry published and DB updated; ACK.
+//   - ErrDLQScheduled  → DLQ published and SetFailed done; ACK.
+//   - ErrJobNotFound   → Consumer routes to DLQ.
+//   - any other error  → treat as fatal; Consumer NACKs.
+func (s *WorkerService) Process(ctx context.Context, req ProcessRequest) error {
+	job, err := s.repo.FindByID(ctx, req.JobID)
 	if err != nil {
 		return err // ErrJobNotFound or DB error
 	}
@@ -117,14 +109,53 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 		return nil
 	}
 
-	// queued → generating
-	if err := s.repo.TransitionStatus(ctx, jobID, StatusQueued, StatusGenerating); err != nil {
+	// Determine which status to transition FROM. On the first attempt (or after
+	// a retry), the job may be queued or retrying.
+	var fromStatus Status
+	switch Status(job.Status) {
+	case StatusQueued:
+		fromStatus = StatusQueued
+	case StatusRetrying:
+		// Validate that the incoming attempt matches the DB expectation to
+		// guard against stale retries (old attempt delivered out of order).
+		if int(job.AttemptCount) != req.Attempt {
+			slog.Warn("worker: stale retry attempt ignored",
+				"job_id", req.JobID,
+				"db_attempt", job.AttemptCount,
+				"msg_attempt", req.Attempt)
+			// Return nil to ACK without re-executing; PM is already completed or
+			// will be cleaned up on the next valid retry.
+			return nil
+		}
+		fromStatus = StatusRetrying
+	case StatusGenerating, StatusValidating, StatusExecuting:
+		// The job is stuck in an intermediate state because a previous worker
+		// crashed after transitioning the status but before persisting the
+		// terminal state. Treat this as a retryable infra fault: schedule a
+		// retry (or DLQ if max attempts reached) using the current status as
+		// the CAS `from` value. The validTransitions map allows
+		// generating/validating/executing → retrying.
+		slog.Warn("worker: job stuck in intermediate state, scheduling retry",
+			"job_id", req.JobID, "status", job.Status, "attempt", req.Attempt)
+		return s.scheduleRetryOrFail(ctx, req, Status(job.Status),
+			fmt.Errorf("stuck in %s after worker crash", job.Status))
+	default:
+		// Unknown/unexpected status — surface as a conflict so the consumer NACKs.
+		return ErrStatusConflict
+	}
+
+	// fromStatus → generating
+	if err := s.repo.TransitionStatus(ctx, req.JobID, fromStatus, StatusGenerating); err != nil {
 		return err
 	}
 
+	return s.runPipeline(ctx, job, req, StatusGenerating)
+}
+
+// runPipeline executes the generating→validating→executing→succeeded stages.
+// currentStatus tracks where the job is so SetRetrying uses the right FROM value.
+func (s *WorkerService) runPipeline(ctx context.Context, job *QueryJob, req ProcessRequest, currentStatus Status) error {
 	// Resolve executor and allowed database for this job.
-	// Legacy jobs (NULL data_source_id) use the static reader DB; jobs with a
-	// DataSourceID open a single-use executor via dsOpener.
 	var exec QueryExecutor
 	var allowedDB string
 	if !job.DataSourceID.Valid {
@@ -132,13 +163,13 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 		allowedDB = s.staticAllowedDB
 	} else {
 		if s.dsOpener == nil {
-			slog.Error("worker: job has DataSourceID but dsOpener is nil", "job_id", jobID)
-			return s.repo.SetFailed(ctx, jobID, StatusGenerating, ErrCodeInternal, msgInternal, s.now())
+			slog.Error("worker: job has DataSourceID but dsOpener is nil", "job_id", req.JobID)
+			return s.scheduleRetryOrFail(ctx, req, currentStatus, errors.New("dsOpener is nil"))
 		}
 		dbName, dynExec, closer, openErr := s.dsOpener.OpenForJob(ctx, uint64(job.DataSourceID.Int64))
 		if openErr != nil {
-			slog.Error("worker: failed to open dynamic data source", "job_id", jobID)
-			return s.repo.SetFailed(ctx, jobID, StatusGenerating, ErrCodeInternal, msgInternal, s.now())
+			slog.Error("worker: failed to open dynamic data source", "job_id", req.JobID)
+			return s.scheduleRetryOrFail(ctx, req, currentStatus, openErr)
 		}
 		defer closer()
 		exec = dynExec
@@ -149,20 +180,20 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 	generatedSQL, err := s.llm.GenerateSQL(ctx, job.Question)
 	if err != nil {
 		now := s.now()
-		code, msg := ErrCodeUnsupportedQuestion, msgUnsupportedQuestion
-		if !errors.Is(err, llm.ErrUnsupportedQuestion) {
-			code, msg = ErrCodeInternal, msgInternal
+		if errors.Is(err, llm.ErrUnsupportedQuestion) {
+			// Deterministic: will not succeed on retry.
+			return s.repo.SetFailed(ctx, req.JobID, currentStatus, ErrCodeUnsupportedQuestion, msgUnsupportedQuestion, now)
 		}
-		return s.repo.SetFailed(ctx, jobID, StatusGenerating, code, msg, now)
+		// Transient LLM failure.
+		return s.scheduleRetryOrFail(ctx, req, currentStatus, err)
 	}
 
 	// generating → validating
-	if err := s.repo.TransitionStatus(ctx, jobID, StatusGenerating, StatusValidating); err != nil {
+	if err := s.repo.TransitionStatus(ctx, req.JobID, StatusGenerating, StatusValidating); err != nil {
 		return err
 	}
+	currentStatus = StatusValidating
 
-	// Validate and normalize the generated SQL. The executor only ever receives
-	// the guard's NormalizedSQL, never the raw LLM output.
 	validated, err := s.guard.Validate(ctx, sqlguard.ValidateInput{
 		SQL:             generatedSQL,
 		AllowedDatabase: allowedDB,
@@ -171,22 +202,19 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 	})
 	if err != nil {
 		if errors.Is(err, sqlguard.ErrRejected) {
-			// Deterministic rejection: a business failure. Persist and ACK.
-			// Do not log the raw SQL or the parser-level reason.
 			now := s.now()
-			return s.repo.SetFailed(ctx, jobID, StatusValidating, ErrCodeSQLValidationFailed, msgSQLValidationFailed, now)
+			return s.repo.SetFailed(ctx, req.JobID, currentStatus, ErrCodeSQLValidationFailed, msgSQLValidationFailed, now)
 		}
-		// Runtime error (e.g. ctx cancellation): do not disguise as a rejection.
-		// Return it so the Consumer applies normal ACK/NACK semantics.
-		return err
+		// Runtime error (e.g. ctx cancellation).
+		return s.scheduleRetryOrFail(ctx, req, currentStatus, err)
 	}
 
 	// validating → executing
-	if err := s.repo.TransitionStatus(ctx, jobID, StatusValidating, StatusExecuting); err != nil {
+	if err := s.repo.TransitionStatus(ctx, req.JobID, StatusValidating, StatusExecuting); err != nil {
 		return err
 	}
+	currentStatus = StatusExecuting
 
-	// Execute the normalized SQL against askdb_demo.
 	execCtx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 
@@ -196,15 +224,16 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 
 	if execErr != nil {
 		now := s.now()
-		return s.repo.SetFailed(ctx, jobID, StatusExecuting, ErrCodeQueryExecution, msgQueryExecution, now)
+		if isRetryableError(execErr) {
+			return s.scheduleRetryOrFail(ctx, req, currentStatus, execErr)
+		}
+		return s.repo.SetFailed(ctx, req.JobID, currentStatus, ErrCodeQueryExecution, msgQueryExecution, now)
 	}
 
-	// Build the cache payload and enforce the result-size limit before writing
-	// to Redis. Serialize once and reuse the bytes for the size check and write.
 	now := s.now()
 	expiresAt := now.Add(s.resultTTL)
 	cached := queryresult.CachedQueryResult{
-		JobID:     jobID,
+		JobID:     req.JobID,
 		Columns:   columns,
 		Rows:      rows,
 		RowCount:  int64(len(rows)),
@@ -214,34 +243,70 @@ func (s *WorkerService) Process(ctx context.Context, jobID uint64) error {
 
 	payload, err := queryresult.Marshal(cached)
 	if err != nil {
-		// Marshalling a validated result should not fail; treat as a fatal error.
 		return err
 	}
 	if int64(len(payload)) > s.maxResultBytes {
-		// Result too large: do not write to Redis. Persist failed and ACK.
-		// Do not log the rows.
-		slog.Warn("worker: query result exceeds size limit", "job_id", jobID)
-		return s.repo.SetFailed(ctx, jobID, StatusExecuting, ErrCodeResultTooLarge, msgResultTooLarge, now)
+		slog.Warn("worker: query result exceeds size limit", "job_id", req.JobID)
+		return s.repo.SetFailed(ctx, req.JobID, currentStatus, ErrCodeResultTooLarge, msgResultTooLarge, now)
 	}
 
-	// Cache the full result in Redis before writing the terminal MySQL state.
-	// If Redis fails, mark the job as failed rather than leaving clients with
-	// a succeeded job they cannot retrieve the result from.
-	if err := s.store.SetRaw(ctx, jobID, payload, s.resultTTL); err != nil {
-		// Redis write failed. Do not log rows (may contain sensitive business data).
-		slog.Error("worker: failed to cache query result", "job_id", jobID)
-		failErr := s.repo.SetFailed(ctx, jobID, StatusExecuting, ErrCodeResultCacheFailed, msgResultCacheFailed, now)
-		if failErr != nil {
-			// SetFailed also failed: return the error so Consumer does not ACK.
-			return failErr
-		}
-		// SetFailed succeeded: return nil so Consumer ACKs.
-		return nil
+	if err := s.store.SetRaw(ctx, req.JobID, payload, s.resultTTL); err != nil {
+		// Redis write failure is a transient infrastructure error; schedule retry.
+		slog.Error("worker: failed to cache query result", "job_id", req.JobID)
+		return s.scheduleRetryOrFail(ctx, req, currentStatus, err)
 	}
 
-	// Redis write succeeded. Now atomically persist the terminal success state.
-	// generated_sql stores the normalized SQL that was actually executed, never
-	// the raw LLM output. If this fails, the Redis key is orphaned but cleaned up
-	// by TTL, and the Consumer must not ACK — return the error.
-	return s.repo.SetSucceeded(ctx, jobID, StatusExecuting, validated.NormalizedSQL, int64(len(rows)), durationMs, now, &expiresAt)
+	return s.repo.SetSucceeded(ctx, req.JobID, currentStatus, validated.NormalizedSQL, int64(len(rows)), durationMs, now, &expiresAt)
+}
+
+// scheduleRetryOrFail publishes a retry message if attempt < maxRetries;
+// otherwise publishes to the DLQ and marks the job as failed.
+func (s *WorkerService) scheduleRetryOrFail(ctx context.Context, req ProcessRequest, fromStatus Status, cause error) error {
+	nextAttempt := req.Attempt + 1
+	if nextAttempt <= s.maxRetries {
+		return s.scheduleRetry(ctx, req, fromStatus, uint8(nextAttempt))
+	}
+	return s.scheduleDLQ(ctx, req, fromStatus)
+}
+
+// scheduleRetry publishes attempt+1 to the retry queue (with confirm), then
+// updates the job to retrying state. Returns ErrRetryScheduled on success so
+// the Consumer marks PM retry_scheduled and ACKs.
+func (s *WorkerService) scheduleRetry(ctx context.Context, req ProcessRequest, fromStatus Status, nextAttempt uint8) error {
+	nextRetryAt := s.now().Add(s.retryDelay)
+	if err := s.retryPub.PublishRetry(ctx, req.JobID, req.MessageID, int(nextAttempt)); err != nil {
+		// Retry publish failed: return error so Consumer NACKs.
+		slog.Error("worker: retry publish failed", "job_id", req.JobID, "attempt", nextAttempt, "err", err)
+		return err
+	}
+	// Publish confirmed. Now update the DB. If this fails, the retry message
+	// is already in the queue (duplicate possible), but the job won't be lost.
+	if err := s.repo.SetRetrying(ctx, req.JobID, fromStatus, nextAttempt, nextRetryAt); err != nil {
+		slog.Error("worker: set retrying failed after publish", "job_id", req.JobID, "err", err)
+		// DB update failed: return error so Consumer NACKs and the message is
+		// requeued. The already-published retry message may cause a duplicate,
+		// but the idempotency layer will handle it.
+		return err
+	}
+	slog.Info("worker: retry scheduled", "job_id", req.JobID, "next_attempt", nextAttempt)
+	return ErrRetryScheduled
+}
+
+// scheduleDLQ publishes to the DLQ (with confirm), then marks the job as failed.
+// Returns ErrDLQScheduled so the Consumer marks PM completed and ACKs.
+func (s *WorkerService) scheduleDLQ(ctx context.Context, req ProcessRequest, fromStatus Status) error {
+	if err := s.retryPub.PublishDLQ(ctx, req.JobID, req.MessageID, req.Attempt); err != nil {
+		slog.Error("worker: dlq publish failed", "job_id", req.JobID, "err", err)
+		return err
+	}
+	// DLQ confirmed. Persist the terminal failed state.
+	now := s.now()
+	if err := s.repo.SetFailed(ctx, req.JobID, fromStatus, ErrCodeMaxRetriesExceeded, msgMaxRetriesExceeded, now); err != nil {
+		slog.Error("worker: set failed after dlq failed", "job_id", req.JobID, "err", err)
+		// DLQ is already published (at-least-once); return error so Consumer NACKs
+		// and retries. The DLQ message may be duplicated but is documented.
+		return err
+	}
+	slog.Info("worker: job sent to dlq", "job_id", req.JobID, "attempt", req.Attempt)
+	return ErrDLQScheduled
 }

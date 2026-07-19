@@ -78,7 +78,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	publisher, err := queryjob.NewRabbitMQPublisher(pubCh)
+	publisher, err := queryjob.NewRabbitMQPublisher(pubCh, cfg.MQConfirmTimeout)
 	if err != nil {
 		slog.Error("publisher init failed", "err", err)
 		os.Exit(1)

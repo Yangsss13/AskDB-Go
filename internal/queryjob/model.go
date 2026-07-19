@@ -30,6 +30,10 @@ type QueryJob struct {
 	// DataSourceID references the data source against which this job runs.
 	// NULL for pre-6B legacy rows; new jobs must provide a non-NULL value.
 	DataSourceID sql.NullInt64 `gorm:"column:data_source_id"`
+	// AttemptCount is incremented each time the job is scheduled for retry.
+	// 0 means the job has never been retried.
+	AttemptCount uint8        `gorm:"column:attempt_count"`
+	NextRetryAt  sql.NullTime `gorm:"column:next_retry_at"`
 }
 
 // TableName pins the table name so GORM does not pluralize unexpectedly.

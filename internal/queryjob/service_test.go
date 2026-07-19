@@ -37,6 +37,14 @@ type fakeRepo struct {
 	setFailedErr    error
 	setFailedCode   string
 	setFailedFrom   Status
+
+	setRetryingCalled bool
+	setRetryingErr    error
+}
+
+func (f *fakeRepo) SetRetrying(_ context.Context, _ uint64, _ Status, _ uint8, _ time.Time) error {
+	f.setRetryingCalled = true
+	return f.setRetryingErr
 }
 
 func (f *fakeRepo) Create(_ context.Context, job *QueryJob) error {
@@ -308,7 +316,20 @@ func (f *fakeRepoWithOrder) SetSucceeded(ctx context.Context, id uint64, from St
 	return f.fakeRepo.SetSucceeded(ctx, id, from, sqlStr, rowCount, durationMs, finishedAt, resultExpiresAt)
 }
 
-// --- WorkerService tests ---
+// fakeRetryPubForWorker is a no-op RetryPublisher used in worker tests that
+// don't exercise retry paths.
+type fakeRetryPubForWorker struct {
+	retryErr error
+	dlqErr   error
+}
+
+func (f *fakeRetryPubForWorker) PublishRetry(_ context.Context, _ uint64, _ string, _ int) error {
+	return f.retryErr
+}
+func (f *fakeRetryPubForWorker) PublishDLQ(_ context.Context, _ uint64, _ string, _ int) error {
+	return f.dlqErr
+}
+func (f *fakeRetryPubForWorker) Close() error { return nil }
 
 // testPolicy is the fixed guard policy used in worker tests.
 var testPolicy = GuardPolicy{
@@ -318,15 +339,26 @@ var testPolicy = GuardPolicy{
 
 func newWorkerSvc(repo Repository, l *fakeLLM, e *fakeExecutor) *WorkerService {
 	store := &fakeResultWriter{}
-	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil)
+	rp := &fakeRetryPubForWorker{}
+	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, rp,
+		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, 3, 30*time.Second)
 }
 
 func newWorkerSvcWithStore(repo Repository, l *fakeLLM, e *fakeExecutor, store ResultWriter) *WorkerService {
-	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, 2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil)
+	rp := &fakeRetryPubForWorker{}
+	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, store, rp,
+		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, 3, 30*time.Second)
 }
 
 func newWorkerSvcFull(repo Repository, l *fakeLLM, g SQLGuard, e *fakeExecutor, store ResultWriter, maxResultBytes int64) *WorkerService {
-	return NewWorkerService(repo, l, g, testPolicy, e, store, 2*time.Second, 15*time.Minute, maxResultBytes, "askdb_demo", nil)
+	rp := &fakeRetryPubForWorker{}
+	return NewWorkerService(repo, l, g, testPolicy, e, store, rp,
+		2*time.Second, 15*time.Minute, maxResultBytes, "askdb_demo", nil, 3, 30*time.Second)
+}
+
+// req builds a ProcessRequest for tests.
+func req(jobID uint64) ProcessRequest {
+	return ProcessRequest{JobID: jobID, MessageID: "test-msg", Attempt: 0}
 }
 
 func TestWorkerService_Process_Success(t *testing.T) {
@@ -336,7 +368,7 @@ func TestWorkerService_Process_Success(t *testing.T) {
 	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}, {int64(2)}}}
 	svc := newWorkerSvc(repo, l, e)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := []string{"queued->generating", "generating->validating", "validating->executing"}
@@ -356,7 +388,7 @@ func TestWorkerService_Process_TerminalJob_ACK(t *testing.T) {
 		repo := &fakeRepo{findResult: job}
 		svc := newWorkerSvc(repo, &fakeLLM{}, &fakeExecutor{})
 
-		err := svc.Process(context.Background(), 1)
+		err := svc.Process(context.Background(), req(1))
 		if err != nil {
 			t.Errorf("status %s: expected nil (ACK), got %v", status, err)
 		}
@@ -370,7 +402,7 @@ func TestWorkerService_Process_JobNotFound(t *testing.T) {
 	repo := &fakeRepo{findErr: ErrJobNotFound}
 	svc := newWorkerSvc(repo, &fakeLLM{}, &fakeExecutor{})
 
-	err := svc.Process(context.Background(), 99)
+	err := svc.Process(context.Background(), req(99))
 	if !errors.Is(err, ErrJobNotFound) {
 		t.Errorf("expected ErrJobNotFound, got %v", err)
 	}
@@ -382,7 +414,7 @@ func TestWorkerService_Process_UnsupportedQuestion(t *testing.T) {
 	l := &fakeLLM{err: llm.ErrUnsupportedQuestion}
 	svc := newWorkerSvc(repo, l, &fakeExecutor{})
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !repo.setFailedCalled || repo.setFailedCode != ErrCodeUnsupportedQuestion {
@@ -390,18 +422,23 @@ func TestWorkerService_Process_UnsupportedQuestion(t *testing.T) {
 	}
 }
 
-func TestWorkerService_Process_QueryExecutionFailure(t *testing.T) {
+func TestWorkerService_Process_QueryExecutionFailure_SchedulesRetry(t *testing.T) {
+	// Phase 7: a transient execution error triggers retry (not immediate SetFailed).
 	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
 	repo := &fakeRepo{findResult: job}
 	l := &fakeLLM{sql: "SELECT 1"}
 	e := &fakeExecutor{err: errors.New("driver: connection refused")}
 	svc := newWorkerSvc(repo, l, e)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	err := svc.Process(context.Background(), req(1))
+	if !errors.Is(err, ErrRetryScheduled) {
+		t.Errorf("expected ErrRetryScheduled for transient exec failure, got %v", err)
 	}
-	if !repo.setFailedCalled || repo.setFailedCode != ErrCodeQueryExecution {
-		t.Errorf("expected QUERY_EXECUTION_FAILED, got code=%q", repo.setFailedCode)
+	if repo.setFailedCalled {
+		t.Error("SetFailed must not be called on retryable error (attempt 0 < maxRetries 3)")
+	}
+	if !repo.setRetryingCalled {
+		t.Error("SetRetrying must be called when scheduling retry")
 	}
 }
 
@@ -415,7 +452,7 @@ func TestWorkerService_Process_FinalUpdateFailure_NoACK(t *testing.T) {
 	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
 	svc := newWorkerSvc(repo, l, e)
 
-	err := svc.Process(context.Background(), 1)
+	err := svc.Process(context.Background(), req(1))
 	if err == nil {
 		t.Fatal("expected error when SetSucceeded fails (must not ACK)")
 	}
@@ -434,7 +471,7 @@ func TestWorkerService_Process_RedisBeforeMySQL(t *testing.T) {
 	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
 	svc := newWorkerSvcWithStore(repo, l, e, store)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(store.callOrder) < 2 {
@@ -448,7 +485,9 @@ func TestWorkerService_Process_RedisBeforeMySQL(t *testing.T) {
 	}
 }
 
-func TestWorkerService_Process_RedisSetFails_TaskMarkedFailed(t *testing.T) {
+func TestWorkerService_Process_RedisSetFails_SchedulesRetry(t *testing.T) {
+	// Phase 7: Redis write failure is a transient infra error → schedules retry,
+	// NOT immediate SetFailed.
 	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
 	store := &fakeResultWriter{setErr: errors.New("redis unavailable")}
 	repo := &fakeRepo{findResult: job}
@@ -456,36 +495,36 @@ func TestWorkerService_Process_RedisSetFails_TaskMarkedFailed(t *testing.T) {
 	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
 	svc := newWorkerSvcWithStore(repo, l, e, store)
 
-	// Process must return nil (Consumer ACKs) even when Redis fails, as long as
-	// SetFailed succeeds.
-	if err := svc.Process(context.Background(), 1); err != nil {
-		t.Fatalf("expected nil when Redis fails and SetFailed succeeds, got %v", err)
+	err := svc.Process(context.Background(), req(1))
+	if !errors.Is(err, ErrRetryScheduled) {
+		t.Errorf("expected ErrRetryScheduled when Redis fails, got %v", err)
 	}
-	if !repo.setFailedCalled {
-		t.Error("SetFailed must be called when Redis write fails")
+	if repo.setFailedCalled {
+		t.Error("SetFailed must not be called on retryable Redis failure")
 	}
-	if repo.setFailedCode != ErrCodeResultCacheFailed {
-		t.Errorf("expected RESULT_CACHE_FAILED, got %q", repo.setFailedCode)
+	if !repo.setRetryingCalled {
+		t.Error("SetRetrying must be called when scheduling retry after Redis failure")
 	}
 	if repo.setSucceededCalled {
 		t.Error("SetSucceeded must not be called when Redis write fails")
 	}
 }
 
-func TestWorkerService_Process_RedisSetFails_SetFailedAlsoFails_NoACK(t *testing.T) {
+func TestWorkerService_Process_RedisSetFails_SetRetryingAlsoFails_NoACK(t *testing.T) {
+	// Redis fails AND SetRetrying fails → consumer must not ACK.
 	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
 	store := &fakeResultWriter{setErr: errors.New("redis unavailable")}
 	repo := &fakeRepo{
-		findResult:   job,
-		setFailedErr: errors.New("db write failed"),
+		findResult:     job,
+		setRetryingErr: errors.New("db write failed"),
 	}
 	l := &fakeLLM{sql: "SELECT 1"}
 	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
 	svc := newWorkerSvcWithStore(repo, l, e, store)
 
-	err := svc.Process(context.Background(), 1)
+	err := svc.Process(context.Background(), req(1))
 	if err == nil {
-		t.Fatal("expected error when both Redis and SetFailed fail (must not ACK)")
+		t.Fatal("expected error when Redis fails and SetRetrying also fails (must not ACK)")
 	}
 }
 
@@ -500,7 +539,7 @@ func TestWorkerService_Process_RedisSucceeds_MySQLFails_NoACK(t *testing.T) {
 	e := &fakeExecutor{columns: []string{"id"}, rows: [][]any{{int64(1)}}}
 	svc := newWorkerSvcWithStore(repo, l, e, store)
 
-	err := svc.Process(context.Background(), 1)
+	err := svc.Process(context.Background(), req(1))
 	if err == nil {
 		t.Fatal("expected error when Redis succeeds but MySQL SetSucceeded fails (must not ACK)")
 	}
@@ -510,6 +549,7 @@ func TestWorkerService_Process_RedisSucceeds_MySQLFails_NoACK(t *testing.T) {
 }
 
 func TestWorkerService_Process_QueryFails_NoRedisWrite(t *testing.T) {
+	// Phase 7: transient exec error schedules retry; Redis must not be called.
 	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
 	store := &fakeResultWriter{}
 	repo := &fakeRepo{findResult: job}
@@ -517,8 +557,10 @@ func TestWorkerService_Process_QueryFails_NoRedisWrite(t *testing.T) {
 	e := &fakeExecutor{err: errors.New("query failed")}
 	svc := newWorkerSvcWithStore(repo, l, e, store)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	err := svc.Process(context.Background(), req(1))
+	// Phase 7: transient failure → ErrRetryScheduled (not nil)
+	if !errors.Is(err, ErrRetryScheduled) {
+		t.Fatalf("expected ErrRetryScheduled for transient exec failure, got %v", err)
 	}
 	if store.setCalled {
 		t.Error("Redis Set must not be called when query execution fails")
@@ -532,7 +574,7 @@ func TestWorkerService_Process_UnsupportedQuestion_NoRedisWrite(t *testing.T) {
 	l := &fakeLLM{err: llm.ErrUnsupportedQuestion}
 	svc := newWorkerSvcWithStore(repo, l, &fakeExecutor{}, store)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if store.setCalled {
@@ -729,7 +771,7 @@ func TestWorkerService_Process_GuardTransitions(t *testing.T) {
 	store := &fakeResultWriter{}
 	svc := newWorkerSvcFull(repo, l, &fakeGuard{normalizedSQL: "SELECT `id` FROM `products` LIMIT 100"}, e, store, 1048576)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := []string{"queued->generating", "generating->validating", "validating->executing"}
@@ -755,7 +797,7 @@ func TestWorkerService_Process_ExecutesNormalizedSQL(t *testing.T) {
 	normalized := "SELECT `id` FROM `products` LIMIT 100"
 	svc := newWorkerSvcFull(repo, l, &fakeGuard{normalizedSQL: normalized}, e, store, 1048576)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if e.gotQuery != normalized {
@@ -778,7 +820,7 @@ func TestWorkerService_Process_GuardRejects(t *testing.T) {
 	guard := &fakeGuard{err: fmt.Errorf("%w: disallowed", sqlguard.ErrRejected)}
 	svc := newWorkerSvcFull(repo, l, guard, e, store, 1048576)
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("expected nil (ACK) on rejection, got %v", err)
 	}
 	if e.called {
@@ -805,7 +847,7 @@ func TestWorkerService_Process_GuardRejects_SetFailedFails_NoACK(t *testing.T) {
 	guard := &fakeGuard{err: fmt.Errorf("%w: disallowed", sqlguard.ErrRejected)}
 	svc := newWorkerSvcFull(repo, l, guard, &fakeExecutor{}, &fakeResultWriter{}, 1048576)
 
-	if err := svc.Process(context.Background(), 1); err == nil {
+	if err := svc.Process(context.Background(), req(1)); err == nil {
 		t.Fatal("expected error when SetFailed fails after rejection (must not ACK)")
 	}
 }
@@ -819,7 +861,7 @@ func TestWorkerService_Process_GuardRuntimeError_NoACK(t *testing.T) {
 	guard := &fakeGuard{err: context.Canceled}
 	svc := newWorkerSvcFull(repo, l0(), guard, &fakeExecutor{}, &fakeResultWriter{}, 1048576)
 
-	err := svc.Process(context.Background(), 1)
+	err := svc.Process(context.Background(), req(1))
 	if err == nil {
 		t.Fatal("expected runtime error to be returned")
 	}
@@ -839,7 +881,7 @@ func TestWorkerService_Process_ResultTooLarge(t *testing.T) {
 	store := &fakeResultWriter{}
 	svc := newWorkerSvcFull(repo, l, &fakeGuard{}, e, store, 64) // 64-byte limit
 
-	if err := svc.Process(context.Background(), 1); err != nil {
+	if err := svc.Process(context.Background(), req(1)); err != nil {
 		t.Fatalf("expected nil (ACK) on RESULT_TOO_LARGE, got %v", err)
 	}
 	if store.setCalled {
@@ -967,5 +1009,161 @@ func TestService_Submit_DataSourceNotOwned(t *testing.T) {
 	}
 	if len(pub.published) != 0 {
 		t.Error("must not publish when data source ownership check fails")
+	}
+}
+
+// ─── Phase 7: WorkerService retry / DLQ tests ────────────────────────────────
+
+// newWorkerSvcMaxRetries builds a WorkerService with a configurable maxRetries.
+func newWorkerSvcMaxRetries(repo Repository, l *fakeLLM, e *fakeExecutor, rp RetryPublisher, maxRetries int) *WorkerService {
+	return NewWorkerService(repo, l, &fakeGuard{}, testPolicy, e, &fakeResultWriter{}, rp,
+		2*time.Second, 15*time.Minute, 1048576, "askdb_demo", nil, maxRetries, 30*time.Second)
+}
+
+func TestWorkerService_Retry_PublishesRetryAndSetsRetrying(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{err: errors.New("llm transient error")}
+	rp := &fakeRetryPubForWorker{}
+	svc := newWorkerSvcMaxRetries(repo, l, &fakeExecutor{}, rp, 3)
+
+	err := svc.Process(context.Background(), req(1))
+	if !errors.Is(err, ErrRetryScheduled) {
+		t.Errorf("expected ErrRetryScheduled, got %v", err)
+	}
+	if !repo.setRetryingCalled {
+		t.Error("SetRetrying must be called when scheduling retry")
+	}
+	if repo.setFailedCalled {
+		t.Error("SetFailed must not be called on retryable error below maxRetries")
+	}
+}
+
+func TestWorkerService_Retry_PublishFails_ReturnsError(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{err: errors.New("llm transient error")}
+	rp := &fakeRetryPubForWorker{retryErr: errors.New("broker unavailable")}
+	svc := newWorkerSvcMaxRetries(repo, l, &fakeExecutor{}, rp, 3)
+
+	err := svc.Process(context.Background(), req(1))
+	if err == nil || errors.Is(err, ErrRetryScheduled) {
+		t.Errorf("expected publish error, got %v", err)
+	}
+	if repo.setRetryingCalled {
+		t.Error("SetRetrying must not be called when retry publish fails")
+	}
+}
+
+func TestWorkerService_Retry_SetRetryingFails_ReturnsError(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job, setRetryingErr: errors.New("db down")}
+	l := &fakeLLM{err: errors.New("llm transient error")}
+	rp := &fakeRetryPubForWorker{}
+	svc := newWorkerSvcMaxRetries(repo, l, &fakeExecutor{}, rp, 3)
+
+	// Retry publish succeeds but DB update fails → return error so consumer NACKs.
+	err := svc.Process(context.Background(), req(1))
+	if err == nil {
+		t.Error("expected error when SetRetrying fails after publish")
+	}
+}
+
+func TestWorkerService_MaxRetries_SchedulesDLQ(t *testing.T) {
+	// attempt == maxRetries → DLQ, not another retry.
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusRetrying), AttemptCount: 3}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{err: errors.New("llm transient error")}
+	rp := &fakeRetryPubForWorker{}
+	svc := newWorkerSvcMaxRetries(repo, l, &fakeExecutor{}, rp, 3)
+
+	r := ProcessRequest{JobID: 1, MessageID: "msg", Attempt: 3}
+	err := svc.Process(context.Background(), r)
+	if !errors.Is(err, ErrDLQScheduled) {
+		t.Errorf("expected ErrDLQScheduled at maxRetries, got %v", err)
+	}
+	if !repo.setFailedCalled {
+		t.Error("SetFailed must be called when max retries reached")
+	}
+	if repo.setFailedCode != ErrCodeMaxRetriesExceeded {
+		t.Errorf("expected MAX_RETRIES_EXCEEDED code, got %q", repo.setFailedCode)
+	}
+}
+
+func TestWorkerService_MaxRetries_DLQPublishFails_ReturnsError(t *testing.T) {
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusRetrying), AttemptCount: 3}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{err: errors.New("llm transient error")}
+	rp := &fakeRetryPubForWorker{dlqErr: errors.New("broker down")}
+	svc := newWorkerSvcMaxRetries(repo, l, &fakeExecutor{}, rp, 3)
+
+	r := ProcessRequest{JobID: 1, MessageID: "msg", Attempt: 3}
+	err := svc.Process(context.Background(), r)
+	if err == nil || errors.Is(err, ErrDLQScheduled) {
+		t.Errorf("expected publish error when DLQ fails, got %v", err)
+	}
+	if repo.setFailedCalled {
+		t.Error("SetFailed must not be called when DLQ publish fails")
+	}
+}
+
+func TestWorkerService_Retry_StaleAttempt_Ignored(t *testing.T) {
+	// DB has attempt_count=2, but message carries attempt=1 → stale; ACK with nil.
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusRetrying), AttemptCount: 2}
+	repo := &fakeRepo{findResult: job}
+	svc := newWorkerSvcMaxRetries(repo, &fakeLLM{}, &fakeExecutor{}, &fakeRetryPubForWorker{}, 3)
+
+	r := ProcessRequest{JobID: 1, MessageID: "msg", Attempt: 1}
+	err := svc.Process(context.Background(), r)
+	if err != nil {
+		t.Errorf("stale attempt must be ignored (return nil), got %v", err)
+	}
+	if len(repo.transitions) != 0 {
+		t.Error("no transition must happen for stale attempt")
+	}
+}
+
+func TestWorkerService_Retry_FutureAttempt_StaleIgnored(t *testing.T) {
+	// DB has attempt_count=1, message carries attempt=2 → future attempt; also stale.
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusRetrying), AttemptCount: 1}
+	repo := &fakeRepo{findResult: job}
+	svc := newWorkerSvcMaxRetries(repo, &fakeLLM{}, &fakeExecutor{}, &fakeRetryPubForWorker{}, 3)
+
+	r := ProcessRequest{JobID: 1, MessageID: "msg", Attempt: 2}
+	err := svc.Process(context.Background(), r)
+	if err != nil {
+		t.Errorf("future attempt mismatch must be ignored (return nil), got %v", err)
+	}
+}
+
+func TestWorkerService_TerminalState_RetryMessage_ACK(t *testing.T) {
+	// A retry message arrives after the job already succeeded (race). Must ACK.
+	for _, s := range []Status{StatusSucceeded, StatusFailed} {
+		job := &QueryJob{ID: 1, Status: string(s)}
+		repo := &fakeRepo{findResult: job}
+		svc := newWorkerSvcMaxRetries(repo, &fakeLLM{}, &fakeExecutor{}, &fakeRetryPubForWorker{}, 3)
+
+		r := ProcessRequest{JobID: 1, MessageID: "msg", Attempt: 1}
+		err := svc.Process(context.Background(), r)
+		if err != nil {
+			t.Errorf("status=%s: expected nil for terminal job redelivery, got %v", s, err)
+		}
+		if len(repo.transitions) != 0 {
+			t.Errorf("status=%s: must not transition terminal job", s)
+		}
+	}
+}
+
+func TestWorkerService_ZeroMaxRetries_ImmediatelyDLQ(t *testing.T) {
+	// maxRetries=0 means no retries: first failure → DLQ immediately.
+	job := &QueryJob{ID: 1, Question: "查询所有商品", Status: string(StatusQueued)}
+	repo := &fakeRepo{findResult: job}
+	l := &fakeLLM{err: errors.New("llm transient error")}
+	rp := &fakeRetryPubForWorker{}
+	svc := newWorkerSvcMaxRetries(repo, l, &fakeExecutor{}, rp, 0)
+
+	err := svc.Process(context.Background(), req(1))
+	if !errors.Is(err, ErrDLQScheduled) {
+		t.Errorf("expected ErrDLQScheduled with maxRetries=0, got %v", err)
 	}
 }

@@ -62,8 +62,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Retry / DLQ publisher uses its own dedicated confirm-mode channel.
+	retryPubCh, err := mq.NewChannel()
+	if err != nil {
+		slog.Error("rabbitmq: open retry publisher channel failed", "err", err)
+		os.Exit(1)
+	}
+
 	// --- worker wiring ---
 	repo := queryjob.NewGORMRepository(db.GORM)
+	pmRepo := queryjob.NewGORMProcessedMessageRepository(db.GORM)
 
 	// DATA_SOURCE_KEY is required by both processes.
 	if err := cfg.ValidateDataSourceKey(); err != nil {
@@ -100,13 +108,22 @@ func main() {
 	}
 	executor := queryexec.NewExecutor(readerDB.SQL, cfg.MaxQueryRows)
 	resultStore := queryresult.NewRedisStore(rdb)
+
+	retryDelayMs := cfg.RetryDelay.Milliseconds()
+	retryPub, err := queryjob.NewRabbitMQRetryPublisher(retryPubCh, retryDelayMs, cfg.MQConfirmTimeout)
+	if err != nil {
+		slog.Error("retry publisher init failed", "err", err)
+		os.Exit(1)
+	}
+
 	workerSvc := queryjob.NewWorkerService(
-		repo, fakeLLM, guard, policy, executor, resultStore,
+		repo, fakeLLM, guard, policy, executor, resultStore, retryPub,
 		cfg.QueryTimeout, cfg.QueryResultTTL, cfg.MaxResultBytes,
 		"askdb_demo", dsOpener,
+		cfg.RetryMaxAttempts, cfg.RetryDelay,
 	)
 
-	consumer, err := queryjob.NewConsumer(conCh, workerSvc)
+	consumer, err := queryjob.NewConsumer(conCh, workerSvc, retryPub, pmRepo)
 	if err != nil {
 		slog.Error("consumer init failed", "err", err)
 		os.Exit(1)

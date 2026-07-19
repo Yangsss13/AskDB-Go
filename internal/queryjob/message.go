@@ -8,6 +8,11 @@ const MessageTypeQueryExecutionRequested = "query.execution.requested"
 // messageVersion is the current envelope version for query execution messages.
 const messageVersion = 1
 
+// HeaderAttempt is the AMQP message header key carrying the number of retries
+// already performed. It is an int32 starting at 0 (no prior retries).
+// The message body and message_id are never modified on retry.
+const HeaderAttempt = "x-attempt"
+
 // QueryJobMessage is the JSON envelope published to RabbitMQ when a query job
 // is accepted. It carries only the job_id; the worker reads the full job from
 // MySQL. Sensitive fields (question, SQL, DSN, credentials) must never appear

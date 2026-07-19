@@ -78,6 +78,20 @@ type Config struct {
 	// connections when no per-source override is set. Configured via
 	// DATA_SOURCE_CONNECT_TIMEOUT (default 5s).
 	DataSourceConnectTimeout time.Duration
+
+	// Phase 7: retry / DLQ reliability configuration.
+
+	// MQConfirmTimeout is the maximum time to wait for a Publisher Confirm ACK.
+	// Configured via MQ_CONFIRM_TIMEOUT (default 5s).
+	MQConfirmTimeout time.Duration
+
+	// RetryMaxAttempts is the maximum number of retries (not counting the initial
+	// execution). 0 disables retries. Configured via RETRY_MAX_ATTEMPTS (default 3).
+	RetryMaxAttempts int
+
+	// RetryDelay is the fixed TTL applied to messages on the retry queue.
+	// Configured via RETRY_DELAY (default 30s).
+	RetryDelay time.Duration
 }
 
 // Load reads the .env file (if present) as a fallback, then reads environment
@@ -110,6 +124,9 @@ func Load() (*Config, error) {
 		AllowedDBPorts:           getEnv("ALLOWED_DB_PORTS", "3306"),
 		PrivateHostAllowlist:     os.Getenv("PRIVATE_HOST_ALLOWLIST"),
 		DataSourceConnectTimeout: getDurationEnv("DATA_SOURCE_CONNECT_TIMEOUT", 5*time.Second),
+		MQConfirmTimeout:         getDurationEnv("MQ_CONFIRM_TIMEOUT", 5*time.Second),
+		RetryMaxAttempts:         getIntEnv("RETRY_MAX_ATTEMPTS", 3),
+		RetryDelay:               getDurationEnv("RETRY_DELAY", 30*time.Second),
 	}
 
 	// DATA_SOURCE_KEY is base64-encoded; decode and validate length here so

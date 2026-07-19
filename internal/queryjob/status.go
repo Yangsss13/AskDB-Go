@@ -2,15 +2,14 @@ package queryjob
 
 // Status is the lifecycle state of a query job.
 //
-// Logical flow (Stage 5: async via RabbitMQ with SQL Guard):
+// Logical flow (Phase 7: with retry):
 //
 //	pending -> queued -> generating -> validating -> executing -> succeeded
 //	pending / queued / generating / validating / executing -> failed
+//	generating / validating / executing -> retrying -> generating
 //
-// Each state is persisted: "pending" on create, "queued" after the API publishes
-// the message, "generating" while the LLM produces SQL, "validating" while the
-// SQL Guard checks and normalizes it, "executing" while the query runs, and the
-// terminal state on completion.
+// retrying is a non-terminal holding state: the job is waiting for its retry
+// message to be re-delivered from the fixed-TTL retry queue.
 type Status string
 
 const (
@@ -19,6 +18,7 @@ const (
 	StatusGenerating Status = "generating"
 	StatusValidating Status = "validating"
 	StatusExecuting  Status = "executing"
+	StatusRetrying   Status = "retrying"
 	StatusSucceeded  Status = "succeeded"
 	StatusFailed     Status = "failed"
 )
@@ -27,11 +27,13 @@ const (
 var validTransitions = map[Status][]Status{
 	StatusPending:    {StatusQueued, StatusFailed},
 	StatusQueued:     {StatusGenerating, StatusFailed},
-	StatusGenerating: {StatusValidating, StatusFailed},
-	StatusValidating: {StatusExecuting, StatusFailed},
-	StatusExecuting:  {StatusSucceeded, StatusFailed},
-	StatusSucceeded:  {},
-	StatusFailed:     {},
+	StatusGenerating: {StatusValidating, StatusRetrying, StatusFailed},
+	StatusValidating: {StatusExecuting, StatusRetrying, StatusFailed},
+	StatusExecuting:  {StatusSucceeded, StatusRetrying, StatusFailed},
+	// retrying re-enters the pipeline at generating when the retry fires.
+	StatusRetrying:  {StatusGenerating, StatusFailed},
+	StatusSucceeded: {},
+	StatusFailed:    {},
 }
 
 // IsTerminal reports whether s is a final state that cannot transition further.
@@ -40,7 +42,6 @@ func (s Status) IsTerminal() bool {
 }
 
 // CanTransition reports whether moving from s to next is a legal transition.
-// Terminal states (succeeded, failed) can never move to a processing state.
 func (s Status) CanTransition(next Status) bool {
 	for _, allowed := range validTransitions[s] {
 		if allowed == next {

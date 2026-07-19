@@ -67,6 +67,34 @@ func (r *GORMRepository) TransitionStatus(ctx context.Context, id uint64, from, 
 	return nil
 }
 
+// SetRetrying atomically transitions a job to the retrying state from `from`,
+// recording the new attempt count and the time the retry message will be
+// re-delivered. Returns ErrStatusConflict when no rows were affected.
+func (r *GORMRepository) SetRetrying(
+	ctx context.Context,
+	id uint64,
+	from Status,
+	attemptCount uint8,
+	nextRetryAt time.Time,
+) error {
+	res := r.db.WithContext(ctx).
+		Model(&QueryJob{}).
+		Where("id = ? AND status = ?", id, string(from)).
+		Updates(map[string]any{
+			"status":        string(StatusRetrying),
+			"attempt_count": attemptCount,
+			"next_retry_at": sql.NullTime{Time: nextRetryAt, Valid: true},
+			"updated_at":    time.Now(),
+		})
+	if res.Error != nil {
+		return fmt.Errorf("queryjob: set retrying id=%d: %w", id, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("queryjob: set retrying id=%d: %w", id, ErrStatusConflict)
+	}
+	return nil
+}
+
 // SetSucceeded atomically marks a job as succeeded (from `from` status) and
 // writes the final execution metadata. Returns ErrStatusConflict when no rows
 // were affected.
@@ -89,7 +117,6 @@ func (r *GORMRepository) SetSucceeded(
 		"updated_at":            finishedAt,
 	}
 	if resultExpiresAt != nil {
-		// Use time.Time directly; GORM maps it to DATETIME(3) correctly.
 		updates["result_expires_at"] = *resultExpiresAt
 	}
 	res := r.db.WithContext(ctx).
