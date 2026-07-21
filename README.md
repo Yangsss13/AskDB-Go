@@ -124,7 +124,7 @@ internal/config   — 环境变量解析
 internal/infra    — MySQL / Redis / RabbitMQ / 只读 askdb_demo 连接
 internal/handler  — HTTP 处理器与 DTO
 internal/queryjob — 查询任务模型、状态机、Repository、Service、Publisher、Consumer
-internal/llm      — Fake LLM（固定问题 → 硬编码 SQL）
+internal/llm      — Fake LLM 与 OpenAI-compatible LLM（Schema 元数据读取）
 internal/queryexec— database/sql 只读查询与结果类型转换
 internal/queryresult — Redis 结果缓存（序列化、读写、错误处理）
 internal/sqlguard — SQL Guard（AST 校验、LIMIT 重写、表白名单；TiDB parser）
@@ -136,30 +136,36 @@ docs/adr/         — 技术选型记录（ADR）
 
 ---
 
-## 当前能力（阶段 8）
+## 当前能力（阶段 9）
 
-在阶段 6B 链路之上新增**RabbitMQ Retry、DLQ 与消费者幂等**；同时保留用户认证、数据源归属、SQL Guard 与 Redis 结果缓存能力。
+在阶段 6B 链路之上新增**RabbitMQ Retry、DLQ、消费者幂等、Transactional Outbox 与 OpenAI-compatible LLM**；同时保留用户认证、数据源归属、SQL Guard 与 Redis 结果缓存能力。
 
 打通 **RabbitMQ 异步 + SQL Guard + Redis 结果缓存**完整链路：
 
 1. 客户端注册并登录，获取 JWT（HS256），后续携带 `Authorization: Bearer <token>` 访问受保护接口
 2. API 校验 Bearer Token，从 `sub` 解析出用户 ID
-3. API 接收问题，在同一 MySQL 事务中创建 queued 任务并写入 Outbox，Dispatcher 异步发布，立即返回 **HTTP 202**
-4. Worker 消费消息，调用 Fake LLM 生成 SQL
-5. **SQL Guard** 通过 AST 解析验证并规范化 SQL（状态：`validating`）
-6. Guard 拒绝的 SQL 直接标记为 failed，不执行查询
-7. Guard 通过的 SQL 由 QueryExecutor 只读查询演示库
-8. 结果序列化后检查大小限制（MAX_RESULT_BYTES），超限标记 failed
-9. Worker 将完整结果写入 **Redis**（TTL 默认 15 分钟）
-10. Redis 写入成功后，Worker 将 MySQL 任务更新为 succeeded，然后 ACK
-11. 客户端通过 `GET /api/v1/query-jobs/:id` 轮询任务状态（仅本人任务可见）
-12. 任务成功后，客户端调用 `GET /api/v1/query-jobs/:id/result` 获取完整结果（仅本人任务可读）
+3. API 接收问题，在同一 MySQL 事务中创建 `query_job`、完成 `pending→queued` 并写入 Outbox，立即返回 **HTTP 202**
+4. API 内后台 Dispatcher 使用 Lease 与 `SKIP LOCKED` 领取 Outbox，多实例可接管过期任务，再异步发布 RabbitMQ 消息
+5. Worker 消费消息，先从当前任务数据源读取白名单 Schema，再按 `LLM_PROVIDER` 调用 Fake LLM 或 OpenAI-compatible Chat Completions
+6. 生成链路固定为 **Schema → LLM → SQL Guard → NormalizedSQL → QueryExecutor**
+7. **SQL Guard** 通过 AST 解析验证并规范化 SQL（状态：`validating`），拒绝的 SQL 直接标记为 failed，不执行查询
+8. Guard 通过的 `NormalizedSQL` 由 QueryExecutor 使用只读权限查询演示库
+9. 结果序列化后检查大小限制（MAX_RESULT_BYTES），超限标记 failed
+10. Worker 将完整结果写入 **Redis**（TTL 默认 15 分钟）
+11. Redis 写入成功后，Worker 将 MySQL 任务更新为 succeeded，然后 ACK
+12. 客户端通过 `GET /api/v1/query-jobs/:id` 轮询任务状态（仅本人任务可见）
+13. 任务成功后，客户端调用 `GET /api/v1/query-jobs/:id/result` 获取完整结果（仅本人任务可读）
 
 **MySQL 是任务状态的唯一事实来源**。Redis 仅作短期结果缓存。QueryExecutor 永远只接收 Guard 规范化后的 SQL，永远不执行原始 LLM 输出。
 
-当前限制：
+当前限制与安全边界：
 
-- SQL 由 **Fake LLM** 返回硬编码 SELECT，**未接入真实大模型**。
+- `LLM_PROVIDER=fake` 保留确定性 Fake LLM；`LLM_PROVIDER=openai-compatible` 使用标准非流式 Chat Completions。API、migration 与 Fake 模式不依赖 `LLM_API_KEY`，只有真实模式 Worker 校验并使用 API Key。
+- 真实模式只接受运维配置的 `LLM_BASE_URL`：禁止 userinfo、query、fragment 和重定向；默认要求 HTTPS。本地 HTTP 必须显式开启，且所有解析地址为回环地址，实际拨号固定到已校验地址，防止 DNS rebinding。
+- 真实模式生成前只读取当前数据源 `products`、`orders`、`order_items` 的列名、类型、可空性和主键信息；查询参数化并受表、列和 Schema 总字节数限制，不读取业务数据、默认值、密码或 DSN。
+- System Prompt 指定 MySQL 方言，并要求只输出单个 `{"sql":"..."}` JSON 对象；问题按不可信内容分隔。响应必须恰好一个 choice、`finish_reason=stop` 且只含 `sql`，Markdown、空 SQL、截断、多个候选、额外字段或超限 Body 均失败。
+- 网络错误、超时、429、5xx 可重试；401/403、其他 4xx 和非法响应为确定性失败，使用类型化错误与 `errors.Is/As` 分类，不按错误字符串判断。
+- Prompt、问题、API Key、Authorization、响应 Body、原始 SQL 和 DSN 不进入日志或错误摘要；日志仅记录 `job_id`、provider、model、状态码类别和耗时。
 - 结果缓存到期（默认 15 分钟）后不支持重建，需重新提交任务。
 - Outbox Dispatcher 以及 Worker 的 Retry/DLQ 发布均使用 Publisher Confirm、`mandatory=true` 和 Basic.Return 检查；只有发布确认及必要 MySQL 状态写入成功后才 ACK，否则重试或 NACK/requeue。
 - Retry 使用 `askdb.retry` / `askdb.query.retry` 固定 TTL 队列，经 DLX 回流 `askdb.events` 主队列；达到 `RETRY_MAX_ATTEMPTS` 后发布到独立 `askdb.dlq` / `askdb.query.dlq` 并将任务标记 failed。
@@ -173,6 +179,23 @@ docs/adr/         — 技术选型记录（ADR）
 - `query_jobs.user_id` 对历史行为 NULL，这些遗留任务不属于任何用户，任何登录用户访问均返回 404。
 
 Fake LLM 目前支持的固定问题：`查询所有商品`、`查询销量最高的商品`、`查询最近的订单`。
+
+### 阶段 9 LLM 配置
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LLM_PROVIDER` | `fake` | `fake` 或 `openai-compatible`；仅 Worker 选择并初始化 LLM |
+| `LLM_BASE_URL` | 空 | OpenAI-compatible API 根地址；真实模式必填，生产默认 HTTPS |
+| `LLM_API_KEY` | 空 | 真实模式 Worker 必填的 Bearer 凭证；API、migration、Fake 模式不使用 |
+| `LLM_MODEL` | `gpt-4o-mini` | 请求使用的模型标识 |
+| `LLM_TIMEOUT` | `60s` | HTTP 请求超时 |
+| `LLM_TEMPERATURE` | `0.0` | 生成温度 |
+| `LLM_MAX_TOKENS` | `512` | 最大输出 Token 数 |
+| `LLM_MAX_RESP_BYTES` | `524288` | 最大 HTTP 响应 Body 字节数 |
+| `LLM_MAX_SCHEMA_BYTES` | `16384` | 注入 Prompt 的 Schema 最大字节数 |
+| `LLM_ALLOW_LOCAL_HTTP` | `false` | 仅本地回环 HTTP 调试时显式开启 |
+
+本阶段只支持 MySQL 方言、三个白名单表和非流式 Chat Completions；不支持流式响应、对话历史、Tool Calling、Embedding、模型管理后台或其他数据库方言。LLM 不替代 SQL Guard，只有 Guard 返回的 `NormalizedSQL` 才能执行和保存。
 
 ## 数据库迁移
 
@@ -305,56 +328,6 @@ succeeded 轮询响应（含缓存到期时间）：
 
 - [阶段规划](docs/PLAN.md)
 - [架构说明](docs/ARCHITECTURE.md)
-
-## Phase 8: Transactional Outbox
-
-The API transaction creates `query_jobs`, performs `pending -> queued`, and
-inserts one `query.execution.requested` row in `outbox_events`. The transaction
-rolls back as a unit. The API does not publish the initial RabbitMQ message;
-the in-process Dispatcher claims rows with `SKIP LOCKED`, `lease_token`, and
-lease expiry recovery, then publishes asynchronously. RabbitMQ unavailability
-therefore does not prevent a committed submission from returning HTTP 202;
-`/readyz` reports 503 until RabbitMQ is healthy.
-
-Outbox retries use `next_retry_at` and capped exponential backoff, independently
-of the Worker Retry/DLQ queues. `message_id`, `occurred_at`, and the JSON payload
-(`job_id` only) remain stable across republishing. Existing mandatory publish,
-Basic.Return, and Publisher Confirm checks run before marking an event
-`published`. A crash after Confirm and before that mark may duplicate delivery;
-Phase 7 consumer idempotency handles it. This is At-Least-Once delivery, not
-Exactly Once. Real LLM and frontend work remain out of scope.
-
-## Phase 9: OpenAI-compatible LLM
-
-Worker uses `LLM_PROVIDER=fake` by default. `fake` remains deterministic and
-does not require `LLM_API_KEY`; the API process and migrations never validate
-or use that key. `openai-compatible` is Worker-only and requires
-`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, timeout, temperature, output-token,
-response-byte, and schema-byte limits.
-
-`LLM_BASE_URL` is operator configuration, never a request field. Userinfo,
-query, and fragment are rejected; HTTPS is required by default. Plain HTTP is
-accepted only with `LLM_ALLOW_LOCAL_HTTP=true` and all resolved addresses must
-be loopback. Local HTTP dials are pinned to the validated IPs, redirects are
-rejected, and `Authorization` is never forwarded to another host.
-
-Before generation, Worker reads only current-database metadata for
-`products`, `orders`, and `order_items`: column name, type, nullability, and
-primary-key status. Queries are parameterized, stable, bounded by tables,
-columns, and serialized bytes, and do not read business data, defaults,
-credentials, or DSNs.
-
-The fixed MySQL system prompt and delimited untrusted question require one
-JSON object containing only `sql`. Exactly one choice and `finish_reason=stop`
-are required; Markdown, truncation, empty SQL, extra fields, trailing content,
-and oversized bodies fail closed. SQL Guard remains mandatory: only its
-`NormalizedSQL` reaches execution and persistence. Typed `errors.Is/As`
-classification retries network/timeout/429/5xx and permanently fails 401/403,
-other 4xx, or invalid output. Retry/DLQ and Outbox messages remain job_id-only.
-
-Only non-streaming Chat Completions, MySQL syntax, and the three metadata tables
-are supported. Conversation history, streaming, Tool Calling, Embedding,
-model administration, and other SQL dialects are out of scope.
 
 ---
 

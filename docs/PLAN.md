@@ -191,39 +191,20 @@
 - [x] 仅清理保留期后的 `published` 事件，不永久丢弃未发布事件
 
 **可靠性边界**：Confirm 成功但标记 `published` 前崩溃允许重复发布，由阶段 7 消费者幂等兜底；系统仍是 At-Least-Once，不实现 Exactly Once。真实 LLM 与前端不在本阶段范围内。
-### Phase 8 implementation status: Transactional Outbox
 
-- [x] Migration `000009_create_outbox_events`: durable event payload, unique `message_id`, status, retry time, lease token/expiry, and published retention cleanup.
-- [x] One MySQL transaction creates the query job, moves `pending` to `queued`, and inserts the initial `query.execution.requested` event; rollback removes all three effects.
-- [x] API submission no longer publishes RabbitMQ directly. The API can accept and return 202 while RabbitMQ is unavailable; the in-process Dispatcher reconnects asynchronously.
-- [x] Dispatcher uses `FOR UPDATE SKIP LOCKED`, short claim transactions, lease-token CAS, expired `publishing` takeover, graceful shutdown, Confirm, mandatory routing, and Basic.Return handling.
-- [x] Publish failure uses database `next_retry_at` with capped exponential backoff and never permanently discards an unpublished event. Published rows are cleaned in batches after `OUTBOX_PUBLISHED_RETAIN`.
-- [x] Payload contains only `job_id`; `message_id` and `occurred_at` are stable on republish. Worker Retry/DLQ behavior remains Phase 7 behavior.
+---
 
-The end-to-end contract remains **At-Least-Once**. A crash after RabbitMQ Confirm
-but before `published` can republish the same event; `processed_messages` provides
-consumer idempotency. This phase does **not** implement Exactly Once, a real LLM,
-or a frontend.
+### 阶段 9：OpenAI-compatible LLM（已完成）
 
-## Phase 9: OpenAI-compatible LLM
+**目标**：在保留 Fake LLM 的前提下接入真实 OpenAI-compatible Chat Completions，并让 Schema、严格响应解析、SQL Guard 和既有 Retry/DLQ、Outbox 语义保持闭环。
 
-- [x] Provider switch: `LLM_PROVIDER=fake|openai-compatible`; API, migrations,
-  and Fake mode do not require `LLM_API_KEY`; only the real Worker validates it.
-- [x] Operator-only URL validation rejects userinfo, query, fragment, and all
-  redirects. HTTPS is the default; explicitly enabled local HTTP requires every
-  resolved address to be loopback and pins actual dials to those addresses.
-- [x] The real client uses standard `net/http`, context timeout, closed and
-  bounded response bodies, safe typed errors, and no sensitive payload logging.
-- [x] Schema input is limited to parameterized metadata for `products`,
-  `orders`, and `order_items`: name, type, nullability, and primary-key status;
-  table/column/serialized-byte limits and stable ordering are enforced.
-- [x] Pipeline is Schema → LLM → SQL Guard → `NormalizedSQL` → Executor;
-  messages remain `job_id`-only and Phase 7 Retry/DLQ plus Phase 8 Outbox remain.
-- [x] Strict response contract: exactly one choice, `finish_reason=stop`, and
-  one JSON object containing only `sql`; Markdown, truncation, extra content,
-  empty SQL, and oversized bodies fail closed.
+- [x] `LLM_PROVIDER=fake/openai-compatible` 切换；API、migration、Fake 模式不依赖 `LLM_API_KEY`，仅真实模式 Worker 校验真实配置
+- [x] 使用标准 `net/http` 调用非流式 Chat Completions，支持 `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`、timeout、temperature、最大输出 Token、响应 Body 和 Schema 字节数配置
+- [x] Base URL 仅来自运维配置；拒绝 userinfo/query/fragment 和重定向，HTTPS 为默认；本地 HTTP 需显式允许且解析结果和实际拨号均限制为回环地址，防止 DNS rebinding
+- [x] LLM 生成前从当前任务数据源读取 `products`、`orders`、`order_items` 的列名、类型、可空性和主键信息；查询参数化、稳定排序，并限制表、列及总字节数，不读取业务数据、默认值、密码或 DSN
+- [x] System Prompt 固定 MySQL 方言并要求只输出单个 `{"sql":"..."}`；问题按不可信内容分隔；严格要求恰好一个 choice、`finish_reason=stop` 和只含 `sql` 的 JSON 对象，拒绝 Markdown、空 SQL、截断、多候选和超限 Body
+- [x] Worker 流程固定为 Schema → LLM → SQL Guard → `NormalizedSQL` → QueryExecutor；只有 Guard 返回的 `NormalizedSQL` 才能执行和保存，SQL Guard 与只读数据库权限仍是最终安全边界
+- [x] 网络、超时、429、5xx 可重试；401/403、其他 4xx、畸形或不合规响应为确定性失败，使用类型化错误与 `errors.Is/As` 分类
+- [x] 日志与错误摘要不记录 Prompt、问题、API Key、Authorization、响应 Body、原始 SQL 或 DSN；消息仍只含 `job_id`，阶段 7 Retry/DLQ 与阶段 8 Outbox 语义不变
 
-Compatibility limits: non-streaming Chat Completions, MySQL dialect, and the
-three allowlisted tables only. No conversation history, streaming, Tool
-Calling, Embedding, model administration, or other SQL dialects. No migration
-is required; all LLM settings are environment configuration.
+**已知兼容性限制**：仅支持非流式 Chat Completions、MySQL 方言和三个白名单表；不支持流式响应、对话历史、Tool Calling、Embedding、模型管理后台或其他数据库方言。无需新增 migration，LLM 配置均来自环境变量。
